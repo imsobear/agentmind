@@ -6,7 +6,7 @@
   "type": "module",
   "private": false,
   "bin": {
-    "agentmind": "./bin/cli.js"
+    "agentmind-cli": "./bin/cli.js"
   },
   "imports": {
     "#/*": "./src/*"

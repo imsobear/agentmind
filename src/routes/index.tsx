@@ -7,7 +7,7 @@ export const Route = createFileRoute('/')({ component: Empty })
 // `127.0.0.1:8088` is the SSR-time fallback so the rendered HTML is
 // stable across runs (no hydration mismatch). The `useEffect` below
 // upgrades to the real `window.location.host` once we have it, so a
-// user running `agentmind --port 9000` sees the right snippet.
+// user running `agentmind-cli --port 9000` sees the right snippet.
 const FALLBACK_HOST = '127.0.0.1:8088'
 
 function Empty() {

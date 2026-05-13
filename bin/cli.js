@@ -4,7 +4,7 @@
 //
 // Has two modes:
 //
-//   1. PRODUCTION (default for `npx agentmind` / global installs)
+//   1. PRODUCTION (default for `npx agentmind-cli` / global installs)
 //      Runs the prebuilt `dist/agentmind/cli.mjs` on a plain node:http
 //      server. No vite, no devDependencies, ~instant start.
 //
@@ -35,15 +35,15 @@ const forceDev = args.includes('--dev')
 
 if (wantsHelp) {
   process.stdout.write(`
-agentmind — a live window into your agent's mind
+agentmind-cli — a live window into your agent's mind
 
 USAGE:
-  agentmind                 start on port 8088 and open the browser
-  agentmind --port 9000     use a specific port
-  agentmind --no-open       don't auto-open the browser
-  agentmind --data <dir>    persist projects under <dir>/sessions/<id>.jsonl
-                            (default ~/.agentmind)
-  agentmind --dev           force dev mode (vite + HMR) even if dist/ exists
+  agentmind-cli                 start on port 8088 and open the browser
+  agentmind-cli --port 9000     use a specific port
+  agentmind-cli --no-open       don't auto-open the browser
+  agentmind-cli --data <dir>    persist projects under <dir>/sessions/<id>.jsonl
+                                (default ~/.agentmind)
+  agentmind-cli --dev           force dev mode (vite + HMR) even if dist/ exists
 
 POINTING CLAUDE CODE AT IT:
   ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
@@ -80,10 +80,10 @@ if (useProd) {
   try {
     const mod = await import(pathToFileURL(distCli).toString())
     await mod.start({ port, host })
-    process.stdout.write(`  agentmind ready at ${url}\n`)
+    process.stdout.write(`  agentmind-cli ready at ${url}\n`)
     void maybeOpenBrowser()
   } catch (err) {
-    process.stderr.write(`agentmind: failed to start production server\n${err?.stack ?? err}\n`)
+    process.stderr.write(`agentmind-cli: failed to start production server\n${err?.stack ?? err}\n`)
     process.exit(1)
   }
 } else {
@@ -93,7 +93,7 @@ if (useProd) {
   const viteBin = resolve(projectRoot, 'node_modules', '.bin', 'vite')
   if (!existsSync(viteBin)) {
     process.stderr.write(
-      `agentmind: dist/agentmind/cli.mjs missing and vite not installed.\n` +
+      `agentmind-cli: dist/agentmind/cli.mjs missing and vite not installed.\n` +
         `If you're hacking on agentmind, run \`pnpm install && pnpm build\` first.\n`,
     )
     process.exit(1)
