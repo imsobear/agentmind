@@ -1,5 +1,5 @@
 import { useEffect, useState, Fragment } from 'react'
-import { api, subscribeEvents, type InteractionStub, type SessionDetail } from '#/lib/api'
+import { api, subscribeEvents, type InteractionStub, type ProjectDetail } from '#/lib/api'
 import { ScrollArea } from '#/components/ui/scroll-area'
 import { Badge } from '#/components/ui/badge'
 import { Separator } from '#/components/ui/separator'
@@ -7,13 +7,13 @@ import { InteractionCard } from '#/components/InteractionCard'
 import { ActionExecutionSegment } from '#/components/ActionExecutionSegment'
 import { AlertCircle } from 'lucide-react'
 
-export function MessageDetail({ sessionId, messageId }: { sessionId: string; messageId: string }) {
-  const [detail, setDetail] = useState<SessionDetail | null>(null)
+export function MessageDetail({ projectId, messageId }: { projectId: string; messageId: string }) {
+  const [detail, setDetail] = useState<ProjectDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   async function reload() {
     try {
-      const d = await api.getSession(sessionId)
+      const d = await api.getProject(projectId)
       setDetail(d)
       setError(null)
     } catch (e: any) {
@@ -24,10 +24,10 @@ export function MessageDetail({ sessionId, messageId }: { sessionId: string; mes
   useEffect(() => {
     reload()
     const stop = subscribeEvents((e) => {
-      if (e.sessionId === sessionId) reload()
+      if (e.projectId === projectId) reload()
     })
     return stop
-  }, [sessionId, messageId])
+  }, [projectId, messageId])
 
   if (error) {
     return (
@@ -86,7 +86,7 @@ export function MessageDetail({ sessionId, messageId }: { sessionId: string; mes
             return (
               <Fragment key={it.interactionId}>
                 <InteractionCard
-                  sessionId={sessionId}
+                  projectId={projectId}
                   stub={it}
                   index={idx}
                   total={message.interactions.length}

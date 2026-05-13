@@ -1,11 +1,11 @@
 // Connect-style middleware mounted into vite's dev/preview server.
 // Handles:
 //   POST /v1/messages          → proxy to api.anthropic.com (+ capture to JSONL)
-//   GET  /api/sessions         → session list
-//   GET  /api/sessions/:id     → session detail (messages + interaction stubs)
-//   GET  /api/sessions/:id/interactions/:iid → full interaction record
+//   GET  /api/projects         → project list
+//   GET  /api/projects/:id     → project detail (messages + interaction stubs)
+//   GET  /api/projects/:id/interactions/:iid → full interaction record
 //   GET  /api/events           → SSE multiplexer:
-//                                  `capture`     — session/message/interaction created
+//                                  `capture`     — project/message/interaction created
 //                                  `live-update` — throttled partial-response snapshot for an iid
 //                                  `live-done`   — terminal event for an iid
 //
@@ -25,7 +25,12 @@ import type { CapturedInteraction } from '../lib/anthropic-types'
 
 // Singletons — middleware lives for the lifetime of the dev server.
 const storage = new Storage()
-const grouper = new Grouper()
+const grouper = new Grouper({
+  // Lazy-hydrate from disk on first sight of a cwd so message indices
+  // keep increasing across proxy restarts. Without this hook, restarting
+  // mid-project would start indices from 0 and confuse the UI.
+  hydrate: (cwd) => storage.hydrateProject(cwd),
+})
 const liveRegistry = new LiveRegistry()
 const events = new EventEmitter()
 events.setMaxListeners(0)
@@ -48,11 +53,11 @@ function notFound(res: ServerResponse) {
   sendJson(res, 404, { error: 'not_found' })
 }
 
-// Build the API list response: a flat array of session summaries.
-function listSessions() {
-  const rows = storage.listSessions()
-  return rows.map(({ sessionId, mtime, size }) => {
-    const { session, messages, interactions } = storage.loadSession(sessionId)
+// Build the API list response: a flat array of project summaries.
+function listProjects() {
+  const rows = storage.listProjects()
+  return rows.map(({ projectId, mtime, size }) => {
+    const { project, messages, interactions } = storage.loadProject(projectId)
     let totalInput = 0
     let totalOutput = 0
     let totalCacheRead = 0
@@ -82,8 +87,8 @@ function listSessions() {
         )
       }
     }
-    const cwd = resolveSessionCwd(session, interactions)
-    let primaryModel = session?.firstSeenModel
+    const cwd = resolveProjectCwd(project, interactions)
+    let primaryModel = project?.firstSeenModel
     let max = -1
     for (const [m, c] of modelOutputTokens) {
       if (c > max) {
@@ -93,8 +98,8 @@ function listSessions() {
     }
     const aggregatedMessages = aggregateMessages(messages, interactions, countToolUseBlocks)
     return {
-      sessionId,
-      startedAt: session?.startedAt,
+      projectId,
+      startedAt: project?.startedAt,
       cwd,
       model: primaryModel,
       mtime,
@@ -124,17 +129,17 @@ function extractCwdFromRequest(req: { system?: unknown } | undefined): string | 
   return m?.[1]?.trim() || undefined
 }
 
-// Best-effort cwd resolution for a stored session. JSONL is append-only
-// and the very first request that opens a session sometimes lacks a cwd
-// in its system prompt (typical for haiku title-gen helpers), so the
-// persisted `session.cwd` can be undefined even though later
-// interactions in the same session clearly carry one. Falling back to a
-// scan keeps every UI surface (list / detail) showing the same value.
-function resolveSessionCwd(
-  session: { cwd?: string } | undefined,
+// Best-effort cwd resolution for a stored project. The very first
+// request that opens a project sometimes lacks a cwd in its system
+// prompt (typical for haiku title-gen helpers), so the persisted
+// `project.cwd` can be undefined even though later interactions in the
+// same project clearly carry one. Falling back to a scan keeps every
+// UI surface (list / detail) showing the same value.
+function resolveProjectCwd(
+  project: { cwd?: string } | undefined,
   interactions: CapturedInteraction[],
 ): string | undefined {
-  if (session?.cwd) return session.cwd
+  if (project?.cwd) return project.cwd
   for (const it of interactions) {
     const cwd = extractCwdFromRequest(it.request)
     if (cwd) return cwd
@@ -142,15 +147,15 @@ function resolveSessionCwd(
   return undefined
 }
 
-function getSessionDetail(sessionId: string) {
-  const { session, messages, interactions } = storage.loadSession(sessionId)
-  if (!session && !messages.length && !interactions.length) return null
+function getProjectDetail(projectId: string) {
+  const { project, messages, interactions } = storage.loadProject(projectId)
+  if (!project && !messages.length && !interactions.length) return null
   // Aggregate: fold haiku helper calls into the surrounding main agent message
   // so the UI shows one message per user-typed prompt, not one per HTTP round-trip.
   const aggregated = aggregateMessages(messages, interactions, countToolUseBlocks)
-  const cwd = resolveSessionCwd(session, interactions)
+  const cwd = resolveProjectCwd(project, interactions)
   return {
-    session: session ? { ...session, cwd } : session,
+    project: project ? { ...project, cwd } : project,
     messages: aggregated,
   }
 }
@@ -162,8 +167,8 @@ function countToolUseBlocks(it: CapturedInteraction): number {
   return n
 }
 
-function getInteraction(sessionId: string, interactionId: string) {
-  const { interactions } = storage.loadSession(sessionId)
+function getInteraction(projectId: string, interactionId: string) {
+  const { interactions } = storage.loadProject(projectId)
   const it = interactions.find((i) => i.interactionId === interactionId)
   if (!it) return null
   // While the interaction is still streaming the JSONL only has the
@@ -269,25 +274,25 @@ export function createCaptureMiddleware() {
       return
     }
 
-    // /api/sessions
-    if (urlPath === '/api/sessions') {
-      sendJson(res, 200, listSessions())
+    // /api/projects
+    if (urlPath === '/api/projects') {
+      sendJson(res, 200, listProjects())
       return
     }
 
-    // /api/sessions/:id
-    const sessionMatch = urlPath.match(/^\/api\/sessions\/([^/]+)$/)
-    if (sessionMatch) {
-      const id = decodeURIComponent(sessionMatch[1])
-      const detail = getSessionDetail(id)
+    // /api/projects/:id
+    const projectMatch = urlPath.match(/^\/api\/projects\/([^/]+)$/)
+    if (projectMatch) {
+      const id = decodeURIComponent(projectMatch[1])
+      const detail = getProjectDetail(id)
       if (!detail) return notFound(res)
       sendJson(res, 200, detail)
       return
     }
 
-    // /api/sessions/:id/interactions/:iid
+    // /api/projects/:id/interactions/:iid
     const interactionMatch = urlPath.match(
-      /^\/api\/sessions\/([^/]+)\/interactions\/([^/]+)$/,
+      /^\/api\/projects\/([^/]+)\/interactions\/([^/]+)$/,
     )
     if (interactionMatch) {
       const id = decodeURIComponent(interactionMatch[1])

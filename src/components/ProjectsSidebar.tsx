@@ -1,21 +1,21 @@
 import { useEffect, useState } from 'react'
 import { Link, useRouterState } from '@tanstack/react-router'
 import { Activity, Circle } from 'lucide-react'
-import { api, subscribeEvents, type SessionListItem } from '#/lib/api'
+import { api, subscribeEvents, type ProjectListItem } from '#/lib/api'
 import { cn } from '#/lib/utils'
 import { formatDistanceToNowStrict } from 'date-fns'
 import { ScrollArea } from '#/components/ui/scroll-area'
 
-export function SessionsSidebar() {
-  const [sessions, setSessions] = useState<SessionListItem[] | null>(null)
+export function ProjectsSidebar() {
+  const [projects, setProjects] = useState<ProjectListItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const { location } = useRouterState()
-  const activeSid = location.pathname.match(/\/sessions\/([^/]+)/)?.[1]
+  const activePid = location.pathname.match(/\/projects\/([^/]+)/)?.[1]
 
   async function reload() {
     try {
-      const list = await api.listSessions()
-      setSessions(list)
+      const list = await api.listProjects()
+      setProjects(list)
       setError(null)
     } catch (e: any) {
       setError(e?.message ?? String(e))
@@ -35,19 +35,19 @@ export function SessionsSidebar() {
   if (error) {
     return (
       <div className="p-4 text-xs text-destructive">
-        Failed to load sessions: {error}
+        Failed to load projects: {error}
       </div>
     )
   }
 
-  if (sessions === null) {
+  if (projects === null) {
     return <div className="p-4 text-xs text-muted-foreground">Loading…</div>
   }
 
-  if (sessions.length === 0) {
+  if (projects.length === 0) {
     return (
       <div className="p-4 text-xs text-muted-foreground">
-        No captured sessions yet.
+        No captured projects yet.
       </div>
     )
   }
@@ -55,20 +55,20 @@ export function SessionsSidebar() {
   return (
     <ScrollArea className="flex-1">
       <div className="p-2 flex flex-col gap-0.5">
-        {sessions.map((s) => (
-          <SessionRow key={s.sessionId} s={s} active={s.sessionId === activeSid} />
+        {projects.map((p) => (
+          <ProjectRow key={p.projectId} p={p} active={p.projectId === activePid} />
         ))}
       </div>
     </ScrollArea>
   )
 }
 
-function SessionRow({ s, active }: { s: SessionListItem; active: boolean }) {
-  const time = s.startedAt ? new Date(s.startedAt) : new Date(s.mtime)
+function ProjectRow({ p, active }: { p: ProjectListItem; active: boolean }) {
+  const time = p.startedAt ? new Date(p.startedAt) : new Date(p.mtime)
   return (
     <Link
-      to="/sessions/$sid"
-      params={{ sid: s.sessionId }}
+      to="/projects/$pid"
+      params={{ pid: p.projectId }}
       className={cn(
         'flex flex-col gap-1 px-3 py-2 rounded-md text-xs',
         'hover:bg-muted/60 transition-colors',
@@ -76,7 +76,7 @@ function SessionRow({ s, active }: { s: SessionListItem; active: boolean }) {
       )}
     >
       <div className="flex items-center gap-2">
-        {s.isLive ? (
+        {p.isLive ? (
           <span className="relative flex h-2 w-2">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[color:var(--user)] opacity-60" />
             <span className="relative inline-flex rounded-full h-2 w-2 bg-[color:var(--user)]" />
@@ -85,34 +85,34 @@ function SessionRow({ s, active }: { s: SessionListItem; active: boolean }) {
           <Circle className="w-2 h-2 opacity-30 fill-current" />
         )}
         <span className="font-medium text-foreground truncate">
-          {s.cwd ? lastPathSeg(s.cwd) : s.sessionId.slice(0, 8)}
+          {p.cwd ? lastPathSeg(p.cwd) : p.projectId.slice(0, 8)}
         </span>
         <span className="text-muted-foreground ml-auto tabular-nums">
           {formatDistanceToNowStrict(time, { addSuffix: false })}
         </span>
       </div>
       <div className="flex items-center gap-2 text-muted-foreground tabular-nums">
-        <span>{s.messageCount} msg</span>
+        <span>{p.messageCount} msg</span>
         <span>·</span>
-        <span>{s.interactionCount} call</span>
-        {s.tokens.input + s.tokens.output > 0 && (
+        <span>{p.interactionCount} call</span>
+        {p.tokens.input + p.tokens.output > 0 && (
           <>
             <span>·</span>
             <span title="input → output tokens">
-              {formatTokens(s.tokens.input)}→{formatTokens(s.tokens.output)}
+              {formatTokens(p.tokens.input)}→{formatTokens(p.tokens.output)}
             </span>
           </>
         )}
-        {s.isLive && (
+        {p.isLive && (
           <span className="ml-auto flex items-center gap-1 text-[color:var(--user)]">
             <Activity className="w-3 h-3" />
             live
           </span>
         )}
       </div>
-      {s.cwd && (
+      {p.cwd && (
         <div className="text-[10px] text-muted-foreground truncate font-mono opacity-70">
-          {s.cwd}
+          {p.cwd}
         </div>
       )}
     </Link>

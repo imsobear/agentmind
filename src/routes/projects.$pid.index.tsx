@@ -1,7 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { MessageSquare } from 'lucide-react'
 
-export const Route = createFileRoute('/sessions/$sid/')({ component: PickAMessage })
+export const Route = createFileRoute('/projects/$pid/')({ component: PickAMessage })
 
 function PickAMessage() {
   return (
