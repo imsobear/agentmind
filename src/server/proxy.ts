@@ -11,10 +11,10 @@ import { Storage, newId } from './storage'
 import { Grouper } from './grouping'
 import { LiveRegistry } from './liveRegistry'
 
-// Hardcoded upstream. The CLAUDE_PROXY_UPSTREAM env override exists for
+// Hardcoded upstream. The AGENTMIND_UPSTREAM env override exists for
 // integration testing only — do not surface it in user-facing docs.
 function upstreamBase(): string {
-  return process.env.CLAUDE_PROXY_UPSTREAM || 'https://api.anthropic.com'
+  return process.env.AGENTMIND_UPSTREAM || 'https://api.anthropic.com'
 }
 const PROXY_VERSION = '0.1.0'
 

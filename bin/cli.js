@@ -17,14 +17,14 @@ const dataArg = dataFlagIdx >= 0 ? args[dataFlagIdx + 1] : undefined
 
 if (wantsHelp) {
   process.stdout.write(`
-claude-proxy — local proxy that captures Claude Code <-> Anthropic traffic
+agentmind — a live window into your agent's mind
 
 USAGE:
-  claude-proxy                 start on port 8088 and open the browser
-  claude-proxy --port 9000     use a specific port
-  claude-proxy --no-open       don't auto-open the browser
-  claude-proxy --data <dir>    persist sessions under <dir>/sessions/<id>.jsonl
-                               (default ~/.claude-proxy)
+  agentmind                 start on port 8088 and open the browser
+  agentmind --port 9000     use a specific port
+  agentmind --no-open       don't auto-open the browser
+  agentmind --data <dir>    persist projects under <dir>/sessions/<id>.jsonl
+                            (default ~/.agentmind)
 
 POINTING CLAUDE CODE AT IT:
   ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
@@ -34,7 +34,7 @@ POINTING CLAUDE CODE AT IT:
 }
 
 const env = { ...process.env }
-if (dataArg) env.CLAUDE_PROXY_DATA_DIR = resolve(dataArg)
+if (dataArg) env.AGENTMIND_DATA_DIR = resolve(dataArg)
 
 const viteBin = resolve(projectRoot, 'node_modules', '.bin', 'vite')
 const viteArgs = ['dev', '--host', '127.0.0.1', '--port', portArg]
@@ -55,7 +55,7 @@ child.stdout.on('data', async (chunk) => {
   if (!text.includes(portArg) && !text.toLowerCase().includes('local')) return
   opened = true
   await delay(200)
-  process.stdout.write(`\n► Point Claude Code at this proxy:\n    ANTHROPIC_BASE_URL=${url} claude\n\n`)
+  process.stdout.write(`\n► Point Claude Code at agentmind:\n    ANTHROPIC_BASE_URL=${url} claude\n\n`)
   try {
     const { default: open } = await import('open')
     await open(url)

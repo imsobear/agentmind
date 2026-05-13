@@ -1,11 +1,11 @@
 {
-  "name": "claude-proxy-cli",
+  "name": "agentmind",
   "version": "0.1.0",
-  "description": "Local proxy that captures Claude Code traffic and visualises every API/LLM exchange",
+  "description": "A live window into your agent's mind — watch every thought, tool call and reply your coding agent makes, in real time, locally.",
   "type": "module",
   "private": false,
   "bin": {
-    "claude-proxy": "./bin/cli.js"
+    "agentmind": "./bin/cli.js"
   },
   "imports": {
     "#/*": "./src/*"

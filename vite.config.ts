@@ -6,7 +6,7 @@ import { createCaptureMiddleware } from './src/server/middleware'
 
 function captureRoutes(): Plugin {
   return {
-    name: 'claude-proxy-capture',
+      name: 'agentmind-capture',
     configureServer(server) {
       const handler = createCaptureMiddleware()
       server.middlewares.use(handler as unknown as Connect.NextHandleFunction)

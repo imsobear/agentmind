@@ -10,8 +10,8 @@ import type {
 } from '../lib/anthropic-types'
 
 // JSONL layout:
-//   ~/.claude-proxy/sessions/<sessionId>.jsonl
-//   ~/.claude-proxy/index.jsonl  (one line per session for quick listing)
+//   ~/.agentmind/sessions/<sessionId>.jsonl
+//   ~/.agentmind/index.jsonl  (one line per session for quick listing)
 //
 // Each session JSONL is append-only; record kinds:
 //   {type: "session", ...}         exactly one, first line
@@ -23,7 +23,7 @@ import type {
 // We don't seek-and-replace — instead we append the final record and the reader merges by
 // interactionId, last-wins. Simple, crash-safe.
 
-const DEFAULT_DATA_DIR = path.join(os.homedir(), '.claude-proxy')
+const DEFAULT_DATA_DIR = path.join(os.homedir(), '.agentmind')
 
 export interface StorageOpts {
   dataDir?: string
@@ -34,7 +34,7 @@ export class Storage {
   readonly sessionsDir: string
 
   constructor(opts: StorageOpts = {}) {
-    this.dataDir = opts.dataDir ?? process.env.CLAUDE_PROXY_DATA_DIR ?? DEFAULT_DATA_DIR
+    this.dataDir = opts.dataDir ?? process.env.AGENTMIND_DATA_DIR ?? DEFAULT_DATA_DIR
     this.sessionsDir = path.join(this.dataDir, 'sessions')
     fs.mkdirSync(this.sessionsDir, { recursive: true })
   }

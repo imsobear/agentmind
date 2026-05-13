@@ -76,7 +76,7 @@ export function MessagesPane() {
           the product wordmark in the left column. We use the same
           muted-foreground colour as supporting metadata; mono font is
           kept because cwd is a path, but the lower contrast brings the
-          visual weight back below "claude-proxy". */}
+          visual weight back below "AgentMind". */}
       <div className="px-4 border-b border-border min-h-[60px] flex flex-col justify-center">
         <div
           className="font-mono text-xs text-muted-foreground truncate"

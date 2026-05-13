@@ -5,14 +5,14 @@ import appCss from '../styles.css?url'
 import { SessionsSidebar } from '#/components/SessionsSidebar'
 import { MessagesPane } from '#/components/MessagesPane'
 
-const REPO_URL = 'https://github.com/imsobear/claude-proxy-console'
+const REPO_URL = 'https://github.com/imsobear/agentmind'
 
 export const Route = createRootRoute({
   head: () => ({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-      { title: 'claude-proxy — local Claude Code traffic inspector' },
+      { title: "AgentMind — a live window into your agent's mind" },
     ],
     links: [{ rel: 'stylesheet', href: appCss }],
   }),
@@ -60,20 +60,20 @@ function Header() {
   return (
     <div className="px-4 border-b border-border min-h-[60px] flex flex-col justify-center">
       <div className="flex items-center gap-1.5">
-        <span className="font-medium text-sm tracking-tight">claude-proxy</span>
+        <span className="font-medium text-sm tracking-tight">AgentMind</span>
         <a
           href={REPO_URL}
           target="_blank"
           rel="noreferrer noopener"
-          aria-label="View claude-proxy on GitHub"
-          title="View claude-proxy on GitHub"
+          aria-label="View AgentMind on GitHub"
+          title="View AgentMind on GitHub"
           className="text-muted-foreground hover:text-foreground transition-colors leading-none"
         >
           <Github className="w-3.5 h-3.5" />
         </a>
       </div>
       <div className="text-[10px] text-muted-foreground mt-0.5">
-        Local Claude Code traffic inspector
+        A live window into your agent&apos;s mind
       </div>
     </div>
   )

@@ -159,7 +159,7 @@ function getInteraction(sessionId: string, interactionId: string) {
   return interactions.find((i) => i.interactionId === interactionId) ?? null
 }
 
-const VERBOSE = process.env.CLAUDE_PROXY_VERBOSE !== '0'
+const VERBOSE = process.env.AGENTMIND_VERBOSE !== '0'
 
 function logReq(method: string, urlPath: string, extra?: string) {
   if (!VERBOSE) return
