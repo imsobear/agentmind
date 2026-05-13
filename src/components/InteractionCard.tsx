@@ -37,12 +37,12 @@ import { ResponsePanel } from '#/components/ResponsePanel'
 import { formatDuration } from '#/components/MessageDetail'
 
 export function InteractionCard({
-  sessionId,
+  projectId,
   stub,
   index,
   total,
 }: {
-  sessionId: string
+  projectId: string
   stub: InteractionStub
   index: number
   total: number
@@ -71,7 +71,7 @@ export function InteractionCard({
     if (!open) return
     let cancelled = false
     api
-      .getInteraction(sessionId, stub.interactionId)
+      .getInteraction(projectId, stub.interactionId)
       .then((d) => {
         if (!cancelled) setFull(d)
       })
@@ -81,7 +81,7 @@ export function InteractionCard({
     return () => {
       cancelled = true
     }
-  }, [open, sessionId, stub.interactionId, stub.endedAt])
+  }, [open, projectId, stub.interactionId, stub.endedAt])
 
   // Live overlay: while the iter is open and hasn't ended yet, tail
   // the server's LiveRegistry so the response panel populates
@@ -95,14 +95,14 @@ export function InteractionCard({
       setLivePartial(null)
       return
     }
-    const close = subscribeLive(sessionId, stub.interactionId, (snap) => {
+    const close = subscribeLive(projectId, stub.interactionId, (snap) => {
       setLivePartial(snap.response ?? null)
     })
     return () => {
       close()
       setLivePartial(null)
     }
-  }, [open, isLive, sessionId, stub.interactionId])
+  }, [open, isLive, projectId, stub.interactionId])
 
   // While the iter is live, tick a millisecond-resolution counter so
   // the header duration badge updates visibly even when the model is
@@ -147,14 +147,20 @@ export function InteractionCard({
       <button
         onClick={() => setOpen((v) => !v)}
         className={cn(
-          'w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-muted/30 transition-colors',
+          // flex-wrap + min-w-0 on the row + truncate on the model name
+          // is what keeps the chip cluster visible at narrow pane widths.
+          // Without this, chip count × badge width quickly exceeds the
+          // pane and the rightmost chips were getting clipped by main's
+          // overflow-hidden (no horizontal scrollbar, so they just
+          // vanished).
+          'w-full min-w-0 flex flex-wrap items-center gap-x-3 gap-y-1.5 px-4 py-3 text-left hover:bg-muted/30 transition-colors',
           open && 'border-b border-border/50 bg-muted/20',
         )}
       >
-        <span className="text-muted-foreground">
+        <span className="text-muted-foreground shrink-0">
           {open ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </span>
-        <span className="text-[color:var(--llm)] flex items-center gap-1.5 text-xs">
+        <span className="text-[color:var(--llm)] flex items-center gap-1.5 text-xs shrink-0">
           <Send className="w-3.5 h-3.5" />
           <span className="font-mono tabular-nums">
             iter {index + 1}/{total}
@@ -162,33 +168,36 @@ export function InteractionCard({
         </span>
         <Badge
           variant="info"
-          className="!text-[10px] !py-0 gap-1"
+          className="!text-[10px] !py-0 gap-1 shrink-0"
           title="Remote LLM call · request forwarded to api.anthropic.com, response streamed back through this proxy"
         >
           <Cloud className="w-2.5 h-2.5" />
           remote
         </Badge>
-        <span className="text-xs text-muted-foreground font-mono">
+        <span
+          className="text-xs text-muted-foreground font-mono min-w-0 flex-1 truncate"
+          title={stub.model || undefined}
+        >
           {stub.model || '–'}
         </span>
-        <div className="ml-auto flex items-center gap-1.5 text-[11px]">
+        <div className="ml-auto flex flex-wrap items-center gap-1.5 text-[11px]">
           {stub.usage?.input_tokens != null && (
-            <Badge variant="muted" title="input tokens">
+            <Badge variant="muted" className="shrink-0" title="input tokens">
               in {fmt(stub.usage.input_tokens)}
             </Badge>
           )}
           {stub.usage?.output_tokens != null && (
-            <Badge variant="muted" title="output tokens">
+            <Badge variant="muted" className="shrink-0" title="output tokens">
               out {fmt(stub.usage.output_tokens)}
             </Badge>
           )}
           {stub.usage?.cache_read_input_tokens != null && stub.usage.cache_read_input_tokens > 0 && (
-            <Badge variant="muted" title="cache-read tokens">
+            <Badge variant="muted" className="shrink-0" title="cache-read tokens">
               cache {fmt(stub.usage.cache_read_input_tokens)}
             </Badge>
           )}
           {displayedDurationMs != null && (
-            <Badge variant="muted" title={isLive ? 'live duration · ticking' : 'duration'}>
+            <Badge variant="muted" className="shrink-0" title={isLive ? 'live duration · ticking' : 'duration'}>
               <Clock className="w-3 h-3" />
               {formatDuration(displayedDurationMs)}
             </Badge>
@@ -200,7 +209,7 @@ export function InteractionCard({
             // know the iter is alive.
             <Badge
               variant="warn"
-              className="gap-1"
+              className="gap-1 shrink-0"
               title="Upstream is still streaming · response is being assembled live"
             >
               <span className="w-1.5 h-1.5 rounded-full bg-[color:var(--warn)] animate-pulse" />
@@ -208,13 +217,16 @@ export function InteractionCard({
             </Badge>
           ) : (
             stub.stopReason && (
-              <Badge variant={stub.stopReason === 'end_turn' ? 'success' : 'warn'}>
+              <Badge
+                variant={stub.stopReason === 'end_turn' ? 'success' : 'warn'}
+                className="shrink-0"
+              >
                 {stub.stopReason}
               </Badge>
             )
           )}
           {stub.hasError && (
-            <Badge variant="danger" className="gap-1">
+            <Badge variant="danger" className="gap-1 shrink-0">
               <AlertCircle className="w-3 h-3" />
               error
             </Badge>

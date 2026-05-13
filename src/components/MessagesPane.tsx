@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useRouterState } from '@tanstack/react-router'
-import { api, subscribeEvents, type SessionDetail } from '#/lib/api'
+import { api, subscribeEvents, type ProjectDetail } from '#/lib/api'
 import { cn } from '#/lib/utils'
 import { Badge } from '#/components/ui/badge'
 import { ScrollArea } from '#/components/ui/scroll-area'
@@ -8,16 +8,16 @@ import { format } from 'date-fns'
 
 export function MessagesPane() {
   const { location } = useRouterState()
-  const m = location.pathname.match(/^\/sessions\/([^/]+)(?:\/messages\/([^/]+))?/)
-  const sid = m?.[1]
+  const m = location.pathname.match(/^\/projects\/([^/]+)(?:\/messages\/([^/]+))?/)
+  const pid = m?.[1]
   const activeMid = m?.[2]
 
-  const [detail, setDetail] = useState<SessionDetail | null>(null)
+  const [detail, setDetail] = useState<ProjectDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   async function reload(id: string) {
     try {
-      const d = await api.getSession(id)
+      const d = await api.getProject(id)
       setDetail(d)
       setError(null)
     } catch (e: any) {
@@ -26,21 +26,21 @@ export function MessagesPane() {
   }
 
   useEffect(() => {
-    if (!sid) {
+    if (!pid) {
       setDetail(null)
       return
     }
-    reload(sid)
+    reload(pid)
     const stop = subscribeEvents((e) => {
-      if (e.sessionId === sid) reload(sid)
+      if (e.projectId === pid) reload(pid)
     })
     return stop
-  }, [sid])
+  }, [pid])
 
-  if (!sid) {
+  if (!pid) {
     return (
       <div className="p-4 text-xs text-muted-foreground">
-        Select a session on the left.
+        Select a project on the left.
       </div>
     )
   }
@@ -62,10 +62,10 @@ export function MessagesPane() {
   // still reflects the original (oldest-first) chronological order.
   const visibleMessages = [...detail.messages].reverse()
   // The header used to lead with "SESSION <uuid>" — but the user never
-  // refers to sessions by their internal id, they identify them by
-  // working directory, which is also what we now key sessions on. So
+  // refers to projects by their internal id, they identify them by
+  // working directory, which is also what we now key projects on. So
   // the title row shows cwd (or a neutral fallback) and message count
-  // only; the sessionId stays in the URL for navigation but never
+  // only; the projectId stays in the URL for navigation but never
   // leaks into the chrome.
   return (
     <>
@@ -80,9 +80,9 @@ export function MessagesPane() {
       <div className="px-4 border-b border-border min-h-[60px] flex flex-col justify-center">
         <div
           className="font-mono text-xs text-muted-foreground truncate"
-          title={detail.session?.cwd ?? 'cwd unknown'}
+          title={detail.project?.cwd ?? 'cwd unknown'}
         >
-          {detail.session?.cwd ?? (
+          {detail.project?.cwd ?? (
             <span className="italic">cwd unknown</span>
           )}
         </div>
@@ -95,8 +95,8 @@ export function MessagesPane() {
           {visibleMessages.map((m) => (
             <Link
               key={m.messageId}
-              to="/sessions/$sid/messages/$mid"
-              params={{ sid, mid: m.messageId }}
+              to="/projects/$pid/messages/$mid"
+              params={{ pid, mid: m.messageId }}
               className={cn(
                 'flex flex-col gap-1.5 px-3 py-2.5 rounded-md text-xs hover:bg-muted/60 transition-colors',
                 m.messageId === activeMid && 'bg-muted',

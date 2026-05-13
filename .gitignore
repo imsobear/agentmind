@@ -5,6 +5,8 @@ dist
 .vinxi
 .vite
 .turbo
+.tanstack
+.playwright-cli
 src/routeTree.gen.ts
 .DS_Store
 *.log

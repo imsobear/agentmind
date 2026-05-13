@@ -1,6 +1,6 @@
 {
   "name": "agentmind-cli",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "A live window into your agent's mind — watch every thought, tool call and reply your coding agent makes, in real time, locally.",
   "license": "MIT",
   "type": "module",

@@ -22,7 +22,12 @@ project (cwd)
 ```
 
 - **project** — currently keyed by cwd + idle window; see
-  `src/server/grouping.ts`. Target: cwd alone.
+  `src/server/grouping.ts`. Pure cwd → project. No idle window: every
+  request from the same working directory, across runs and across days,
+  lands in the same project. `projectId = sha256(cwd).slice(0,16)` —
+  see `src/server/projectId.ts`. Helper calls without their own cwd
+  (haiku title-gen etc.) attach to the most recent cwd this proxy
+  process saw.
 - **message** — opens when the request's `messages` array isn't a
   prefix-extension of any existing message in the project, OR the
   appended slice contains a new user-typed prompt.
@@ -33,18 +38,23 @@ project (cwd)
   `aggregate.ts:computeActionSegments`. The gap duration is the local
   tool-execution wall-clock.
 
-The Anthropic Messages API has no session header — everything above is
-**inferred** from request shape. Read the comments in `grouping.ts`
-before touching the inference rules.
+The Anthropic Messages API has no project/session header — everything
+above is **inferred** from request shape. Read the comments in
+`grouping.ts` before touching the inference rules.
 
 ## Two state lanes
 
 Persisted and realtime are decoupled. Both lanes must stay correct:
 
-- **Persisted** — append-only JSONL at `~/.agentmind/sessions/<sid>.jsonl`.
-  Two writes per interaction: partial (request only) at start, final
-  (request + response + sseEvents) at stream end. Reader merges
-  last-wins on `interactionId`. Never seek-and-rewrite.
+- **Persisted** — append-only JSONL at `~/.agentmind/projects/<projectId>.jsonl`.
+  `projectId` is `sha256(cwd).slice(0,16)`, so the same cwd always lands
+  in the same file. Two writes per interaction: partial (request only)
+  at start, final (request + response + sseEvents) at stream end.
+  Reader merges last-wins on `interactionId`. Never seek-and-rewrite.
+  Legacy `~/.agentmind/sessions/` + `{type:"session", sessionId}`
+  records are one-shot migrated into the new layout on Storage init
+  (see `migrateLegacy` in `storage.ts`); reads also tolerate them in
+  place if the migration couldn't move a file.
 - **Realtime** — `LiveRegistry` in-process map (lost on restart). The
   proxy feeds every upstream chunk through a `LiveSession`; the
   registry re-emits throttled (150ms per iid) `live-update` and

@@ -280,11 +280,14 @@ export function ContentBlockView({ block }: { block: ContentBlock }) {
   if (block.type === 'tool_use') {
     return (
       <div className="rounded border border-[color:var(--tool)]/30 bg-[color:var(--tool)]/5 px-2 py-1.5">
-        <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-[color:var(--tool)] mb-1">
-          <Wrench className="w-3 h-3" />
-          <span>tool_use</span>
-          <span className="font-mono normal-case text-foreground/90">{block.name}</span>
-          <span className="text-muted-foreground font-mono normal-case ml-auto">
+        <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-[color:var(--tool)] mb-1 min-w-0">
+          <Wrench className="w-3 h-3 shrink-0" />
+          <span className="shrink-0">tool_use</span>
+          <span className="font-mono normal-case text-foreground/90 shrink-0">{block.name}</span>
+          <span
+            className="text-muted-foreground font-mono normal-case ml-auto truncate min-w-0"
+            title={block.id}
+          >
             {block.id}
           </span>
         </div>
