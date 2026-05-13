@@ -1,0 +1,57 @@
+name: Tag
+
+# After a release PR auto-merges into main, this workflow tags the new
+# commit with `vX.Y.Z` and drafts a GitHub release. It only acts when:
+#   - package.json's version isn't already tagged in the repo, AND
+#   - that version is actually published to npm
+# Both conditions together mean "this push truly corresponds to a
+# release the publish workflow shipped" — so non-release pushes (e.g.
+# version bumps on a future release branch that aren't yet shipped)
+# don't get prematurely tagged.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Tag if matching version is on npm and not yet tagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q "$TAG$"; then
+            echo "Tag $TAG already exists — nothing to do."
+            exit 0
+          fi
+
+          if ! npm view "$PKG_NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$PKG_NAME@$VERSION is not on npm yet — skipping tag (this commit is a pre-release bump, not a shipped version)."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "$TAG"
+
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes

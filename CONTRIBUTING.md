@@ -3,20 +3,20 @@
 ## Branch model
 
 - `main` is protected: no direct pushes, ever. Everything lands via PR.
-- The `CI` workflow is a **required status check** — PRs cannot merge
-  while it's red or pending.
+- Two **required status checks** gate every PR into main:
+  - `check` — produced by the **CI** workflow (build + typecheck).
+  - `release` — produced by the **Release** workflow (npm publish).
 - Day-to-day work happens on `release/x.y.z` branches. `x.y.z` is the
   version the work is targeting — keep it in sync with `package.json`'s
   `version` field.
 - `main` is treated as **a log of what has shipped**: a commit only lands
-  on main once the corresponding npm version is already live, not before.
+  on main once the corresponding npm version is already live.
 
-## Release flow
+## Release flow (one button on the PR)
 
-The `Release` workflow is **manual** (`workflow_dispatch`). Publish
-happens on the release branch _first_; only on success does the branch
-get squash-merged into main, deleted, and tagged. If publish fails,
-main is untouched and the operator fixes the branch and re-runs.
+Conceptual sequence: `CI → click "Enable auto-merge" → npm publish → PR
+auto-merges → branch auto-deleted → tag vX.Y.Z`. All three workflows
+participate.
 
 ```bash
 # 1. Branch off main; bake the next version into the branch name.
@@ -30,19 +30,36 @@ git checkout -b release/0.2.0
 git push -u origin release/0.2.0
 gh pr create --base main --title "Release 0.2.0" --body "…"
 
-# 4. Wait for CI to go green on the PR. (Required to merge.)
+# 4. Wait for the `check` status (CI: build + typecheck) to go green on
+#    the PR. The `release` status will still show "pending / expected"
+#    — that's by design.
 
-# 5. When ready to ship: GitHub → Actions → "Release" → Run workflow,
-#    pick the release/0.2.0 branch, click Run.
-#    The workflow will:
-#      - re-verify branch ↔ version
-#      - re-run build + typecheck
-#      - refuse if 0.2.0 is already on npm
-#      - npm publish --provenance
-#      - squash-merge the PR
-#      - delete release/0.2.0
-#      - tag v0.2.0 + draft a GitHub release
+# 5. On the PR, click "Enable auto-merge" and pick "Squash and merge".
+#    From here, no further human action is needed:
+#      a. The Release workflow runs, re-verifies the branch ↔ version,
+#         re-builds, re-typechecks, refuses if 0.2.0 is already on npm,
+#         and `npm publish --provenance`s the package.
+#      b. The `release` status goes green.
+#      c. GitHub's auto-merge sees both required checks green and
+#         squash-merges the PR; the release branch is auto-deleted.
+#      d. The Tag workflow tags `v0.2.0` on main and drafts a GitHub
+#         release with auto-generated notes.
+
+# 6. If publish fails, `release` stays red. Auto-merge keeps waiting.
+#    Fix the branch, push, and the Release workflow re-runs on
+#    `synchronize`. main is untouched until publish actually succeeds.
 ```
+
+## How publishes are gated
+
+| Check | Workflow | Trigger |
+| --- | --- | --- |
+| `check` | `ci.yml` | every non-main push and every PR to main |
+| `release` | `release.yml` | only when auto-merge has been enabled on a `release/x.y.z → main` PR |
+
+The `release` check is intentionally absent until you opt-in via
+"Enable auto-merge". That keeps random PRs from triggering an npm
+publish on every push.
 
 ## Local development
 

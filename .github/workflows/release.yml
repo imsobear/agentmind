@@ -1,93 +1,65 @@
 name: Release
 
-# Manual release pipeline. Must be triggered from a `release/x.y.z` branch
-# whose PR into main is already green on the CI workflow.
+# Publish step in the release pipeline. Listens for the user enabling
+# auto-merge on a `release/x.y.z → main` PR, then publishes
+# `agentmind-cli@x.y.z` to npm. Reports a `release` status check —
+# auto-merge waits for that check to go green before it actually merges
+# the PR.
 #
-# Order of operations (publish first, merge after — so main only ever
-# reflects what's already shipped):
+# Net effect: the user clicks one button on the PR ("Enable auto-merge"),
+# we publish first, and the merge only happens if publish succeeded.
 #
-#   1. Validate branch name + package.json version match.
-#   2. Look up the open PR (release/x.y.z → main); refuse if checks
-#      aren't all green or no PR exists.
-#   3. Re-run build + typecheck (defensive; also writes routeTree.gen.ts).
-#   4. Refuse if `agentmind-cli@x.y.z` is already on the registry.
-#   5. `npm publish --provenance`.
-#   6. Squash-merge the PR (branch is auto-deleted by --delete-branch).
-#   7. Tag `vx.y.z` on main + draft a GitHub release.
-#
-# If any earlier step fails the branch stays unmerged and main is
-# untouched — so a botched release is recoverable by fixing the branch
-# and re-running the workflow.
+# Re-runs on `synchronize` are intentional so that pushing a new commit
+# after enabling auto-merge invalidates the prior publish gate.
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [auto_merge_enabled, synchronize]
 
 permissions:
-  contents: write        # tag + GitHub release
-  pull-requests: write   # squash-merge + delete branch
-  id-token: write        # npm --provenance
+  contents: read
+  pull-requests: read
+  id-token: write     # required for `npm publish --provenance`
 
 concurrency:
-  group: release
+  group: release-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
   release:
+    # Only attempt to publish when auto-merge is currently enabled on
+    # the PR and the head branch is `release/x.y.z`. Other PRs are
+    # ignored — they'll never satisfy the required `release` check, so
+    # they cannot merge into main.
+    if: |
+      github.event.pull_request.auto_merge != null &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
-      - name: Validate branch + version
+      - name: Validate branch ↔ version
         id: meta
         run: |
-          BRANCH="${GITHUB_REF_NAME}"
+          BRANCH="${{ github.event.pull_request.head.ref }}"
           if [[ ! "$BRANCH" =~ ^release/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "::error::Release workflow must run on a release/x.y.z branch, got: $BRANCH"
+            echo "::error::head branch must be release/x.y.z (got: $BRANCH)"
             exit 1
           fi
           VERSION="${BRANCH#release/}"
           PKG_VERSION=$(node -p "require('./package.json').version")
           if [ "$VERSION" != "$PKG_VERSION" ]; then
-            echo "::error::Version mismatch: branch says $VERSION, package.json says $PKG_VERSION"
+            echo "::error::version mismatch: branch=$VERSION, package.json=$PKG_VERSION"
             exit 1
           fi
           PKG_NAME=$(node -p "require('./package.json').name")
-          echo "branch=$BRANCH"   >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
           echo "name=$PKG_NAME"   >> "$GITHUB_OUTPUT"
-
-      - name: Locate PR & gate on green checks
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_NUMBER=$(gh pr list \
-            --head "${{ steps.meta.outputs.branch }}" \
-            --base main \
-            --state open \
-            --json number --jq '.[0].number')
-          if [ -z "$PR_NUMBER" ]; then
-            echo "::error::No open PR found for ${{ steps.meta.outputs.branch }} → main."
-            exit 1
-          fi
-
-          # Reject if any non-Release check is missing or non-success.
-          BAD=$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '
-            [.statusCheckRollup[]
-             | select((.workflowName // "") != "Release")
-             | (.conclusion // "PENDING")]
-            | map(select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED"))
-            | join(",")
-          ')
-          if [ -n "$BAD" ]; then
-            echo "::error::PR #$PR_NUMBER has non-green checks: $BAD"
-            exit 1
-          fi
-          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
       - uses: pnpm/action-setup@v4
         with:
@@ -113,7 +85,7 @@ jobs:
       - name: Refuse if version already on npm
         run: |
           if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version >/dev/null 2>&1; then
-            echo "::error::${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} is already published — refusing to overwrite."
+            echo "::error::${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} is already on the registry — refusing to overwrite."
             exit 1
           fi
 
@@ -121,20 +93,3 @@ jobs:
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Squash-merge PR + delete branch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr merge "${{ steps.pr.outputs.number }}" \
-            --squash --delete-branch \
-            --subject "release: ${{ steps.meta.outputs.version }}" \
-            --body "Automated release via Release workflow."
-
-      - name: Tag + GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.meta.outputs.tag }}
-          name: ${{ steps.meta.outputs.tag }}
-          target_commitish: main
-          generate_release_notes: true
