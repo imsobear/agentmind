@@ -48,7 +48,7 @@ Use it to:
 
 ```bash
 # 1. Run AgentMind (terminal A)
-npx agentmind            # listens on http://127.0.0.1:8088 and opens browser
+npx agentmind-cli        # listens on http://127.0.0.1:8088 and opens browser
 
 # 2. Point Claude Code at it (terminal B)
 ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
@@ -61,9 +61,11 @@ sign-up.
 Install globally if you'd rather not type `npx`:
 
 ```bash
-npm install -g agentmind
+npm install -g agentmind-cli
 agentmind --help
 ```
+
+> The npm package is `agentmind-cli`, but the binary is just `agentmind`.
 
 Flags:
 

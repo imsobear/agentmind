@@ -1,5 +1,5 @@
 {
-  "name": "agentmind",
+  "name": "agentmind-cli",
   "version": "0.1.0",
   "description": "A live window into your agent's mind — watch every thought, tool call and reply your coding agent makes, in real time, locally.",
   "type": "module",
