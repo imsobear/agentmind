@@ -108,7 +108,8 @@ export function createMessagesProxy(deps: ProxyDeps) {
     }
 
     const now = Date.now()
-    const resolution = grouper.resolve(parsed, now, newId)
+    const cwd = extractCwd(parsed)
+    const resolution = grouper.resolve(parsed, now, newId, cwd)
     const interactionId = newId()
     const startedAtIso = new Date(now).toISOString()
 
@@ -119,7 +120,7 @@ export function createMessagesProxy(deps: ProxyDeps) {
         sessionId: resolution.sessionId,
         startedAt: startedAtIso,
         firstSeenModel: parsed.model,
-        cwd: extractCwd(parsed),
+        cwd,
         proxyVersion: PROXY_VERSION,
       })
       onEvent?.({ kind: 'session', sessionId: resolution.sessionId, id: resolution.sessionId })

@@ -61,19 +61,32 @@ export function MessagesPane() {
   // immediately visible without scrolling. The per-row `#index` badge
   // still reflects the original (oldest-first) chronological order.
   const visibleMessages = [...detail.messages].reverse()
+  // The header used to lead with "SESSION <uuid>" — but the user never
+  // refers to sessions by their internal id, they identify them by
+  // working directory, which is also what we now key sessions on. So
+  // the title row shows cwd (or a neutral fallback) and message count
+  // only; the sessionId stays in the URL for navigation but never
+  // leaks into the chrome.
   return (
     <>
-      <div className="px-4 py-3 border-b border-border">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          Session
+      {/* The min-h here mirrors the sidebar Header so both columns line
+          up to the same baseline regardless of typography. Once height
+          is structural we can size the cwd line independently. */}
+      {/* The cwd row is the column's "title", but it must not outshout
+          the product wordmark in the left column. We use the same
+          muted-foreground colour as supporting metadata; mono font is
+          kept because cwd is a path, but the lower contrast brings the
+          visual weight back below "claude-proxy". */}
+      <div className="px-4 border-b border-border min-h-[60px] flex flex-col justify-center">
+        <div
+          className="font-mono text-xs text-muted-foreground truncate"
+          title={detail.session?.cwd ?? 'cwd unknown'}
+        >
+          {detail.session?.cwd ?? (
+            <span className="italic">cwd unknown</span>
+          )}
         </div>
-        <div className="font-mono text-xs truncate mt-0.5">{sid}</div>
-        {detail.session?.cwd && (
-          <div className="text-[10px] text-muted-foreground font-mono truncate mt-1">
-            cwd: {detail.session.cwd}
-          </div>
-        )}
-        <div className="text-[10px] text-muted-foreground mt-1 tabular-nums">
+        <div className="text-[10px] text-muted-foreground/70 mt-0.5 tabular-nums">
           {visibleMessages.length} message{visibleMessages.length === 1 ? '' : 's'}
         </div>
       </div>

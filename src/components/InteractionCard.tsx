@@ -11,6 +11,8 @@ import {
   Braces,
   Activity,
 } from 'lucide-react'
+import JsonView from '@uiw/react-json-view'
+import { vscodeTheme } from '@uiw/react-json-view/vscode'
 import { api, type InteractionStub, type InteractionFull } from '#/lib/api'
 import type { SseEvent } from '#/lib/anthropic-types'
 import { Badge } from '#/components/ui/badge'
@@ -44,8 +46,16 @@ export function InteractionCard({
   const [error, setError] = useState<string | null>(null)
   const [open, setOpen] = useState(true)
 
+  // Refetch whenever the stub changes shape — endedAt transitions from
+  // undefined → ISO once the proxy writes the final record (request +
+  // response + sseEvents). stopReason / durationMs join the stub at the
+  // same moment but endedAt is the canonical "this interaction is now
+  // complete" signal. Without this dep, the card would load the partial
+  // (request-only) snapshot when the iter starts and never refresh
+  // even after the stream completed — exactly the "response stayed
+  // empty" / "request never updates" bug.
   useEffect(() => {
-    if (!open || full) return
+    if (!open) return
     let cancelled = false
     api
       .getInteraction(sessionId, stub.interactionId)
@@ -58,7 +68,7 @@ export function InteractionCard({
     return () => {
       cancelled = true
     }
-  }, [open, sessionId, stub.interactionId, full])
+  }, [open, sessionId, stub.interactionId, stub.endedAt])
 
   const sseEvents = full?.sseEvents ?? []
   const iterLabel = `iter ${index + 1}/${total}`
@@ -225,7 +235,18 @@ function fmt(n: number): string {
  * surface the raw payload without polluting the structured view below.
  */
 function RawJsonButton({ obj, title }: { obj: unknown; title: string }) {
-  const json = JSON.stringify(obj, null, 2) ?? 'null'
+  // Approximate payload size for the header chip. We measure on the
+  // stringified value because the user thinks of "raw JSON" in those
+  // terms ("how big is this request?"), and counting object keys
+  // wouldn't translate to a meaningful answer.
+  const charCount = (() => {
+    try {
+      return JSON.stringify(obj)?.length ?? 0
+    } catch {
+      return 0
+    }
+  })()
+
   return (
     <Dialog>
       <DialogTrigger asChild>
@@ -245,13 +266,30 @@ function RawJsonButton({ obj, title }: { obj: unknown; title: string }) {
             {title}
           </DialogTitle>
           <span className="ml-auto text-[10px] text-muted-foreground tabular-nums font-mono">
-            {json.length.toLocaleString()} chars
+            {charCount.toLocaleString()} chars
           </span>
         </DialogHeader>
-        <DialogBody className="p-0">
-          <pre className="text-[11px] font-mono whitespace-pre-wrap break-words p-4 leading-relaxed">
-            {json}
-          </pre>
+        <DialogBody className="p-3">
+          {/* Tree view with per-node fold/unfold. `collapsed={2}` keeps
+              top-level + first-level keys open by default but folds
+              deeper structures — large payloads (system prompts, tool
+              schemas, message lists) stay scannable instead of
+              dumping thousands of lines at once. */}
+          <JsonView
+            value={obj as object}
+            style={{
+              ...vscodeTheme,
+              fontSize: '12px',
+              fontFamily:
+                'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+              backgroundColor: 'transparent',
+            }}
+            collapsed={2}
+            displayDataTypes={false}
+            displayObjectSize
+            shortenTextAfterLength={240}
+            enableClipboard
+          />
         </DialogBody>
       </DialogContent>
     </Dialog>

@@ -32,13 +32,20 @@ export function RequestPanel({
     // under this column so the information hierarchy stays one level
     // deep and consistent.
     <div className="p-3 flex flex-col gap-2 text-xs">
-      {req.messages.map((m, i) => (
-        <MessageSection
-          key={i}
-          m={m}
-          isNew={i >= prevMessageCount && prevMessageCount > 0}
-        />
-      ))}
+      {/* Messages are rendered newest-first so the `new` badges appear
+          at the top of the list. We compute isNew using each message's
+          ORIGINAL index (i) so the inherited-vs-new split stays
+          correct regardless of visual order. */}
+      {req.messages
+        .map((m, i) => ({
+          m,
+          i,
+          isNew: i >= prevMessageCount && prevMessageCount > 0,
+        }))
+        .reverse()
+        .map(({ m, i, isNew }) => (
+          <MessageSection key={i} m={m} isNew={isNew} />
+        ))}
       {sysBlocks.length > 0 && <SystemSection blocks={sysBlocks} />}
       {req.tools && req.tools.length > 0 && <ToolsSection tools={req.tools} />}
     </div>
@@ -61,9 +68,13 @@ function MessageSection({
   const title = (
     <span className="flex items-baseline gap-0.5">
       <span>messages</span>
+      {/* Role suffix is intentionally muted so the only loud accent
+          on this row is the `new` badge — that's the signal worth the
+          eye's attention. The User/Bot icon already conveys role at
+          a glance, no need for a saturated colour too. */}
       <span
         className={cn(
-          'font-mono',
+          'font-mono opacity-50',
           isUser ? 'text-[color:var(--user)]' : 'text-[color:var(--llm)]',
         )}
       >

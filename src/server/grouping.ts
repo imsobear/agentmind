@@ -9,8 +9,19 @@
 //   (a Haiku for title generation, another for topic classification, …).
 //   These all share a single user-perceived "claude session".
 //
-//   We therefore group all requests within an IDLE WINDOW into one session.
-//   If no proxy traffic for `idleMs`, the next request opens a new session.
+//   Primary key is the working-directory the `claude` process is running
+//   in, recovered best-effort from the system prompt. Two simultaneously
+//   running `claude` invocations in different directories therefore never
+//   collide into one session. Within a directory we still need a time
+//   bound — the user could `claude … && later … claude …` from the same
+//   shell — so we additionally require the previous request in that cwd
+//   to be within an IDLE WINDOW.
+//
+//   Some requests (helper haiku title-gen, classifier, etc.) don't expose
+//   their cwd in the system prompt. Those requests fall back to "any live
+//   session within the idle window" and will attach to the most recent
+//   one. That keeps the helpers grouped with their parent agent even
+//   though we can't see their cwd directly.
 //
 // MESSAGE
 //   Within a session, two requests belong to the same "message" iff
@@ -44,6 +55,11 @@ interface Session {
   sessionId: string
   startedAt: number
   lastSeenAt: number
+  // The working directory the `claude` process was started in, recovered
+  // from the system prompt of the first request that managed to expose
+  // it. May stay undefined for sessions composed entirely of helper
+  // calls (rare but possible).
+  cwd: string | undefined
   messages: Message[]
 }
 
@@ -148,15 +164,33 @@ export class Grouper {
     this.idleMs = opts.idleMs ?? 3 * 60 * 1000
   }
 
-  resolve(req: AnthropicRequest, now: number, newId: () => string): GroupResolution {
+  resolve(
+    req: AnthropicRequest,
+    now: number,
+    newId: () => string,
+    cwd: string | undefined,
+  ): GroupResolution {
     // ── pick / open session
+    //
+    // Walk newest-first. A session matches when:
+    //   • it's still within the idle window, AND
+    //   • the cwds are compatible — either both sides agree, or at least
+    //     one side hasn't yet learned its cwd.
+    // The "at least one side undefined" case is what lets helper haiku
+    // calls (which lack cwd in their slim system prompt) attach to the
+    // same session as their parent agent.
     let session: Session | undefined
     for (let i = this.sessions.length - 1; i >= 0; i--) {
       const s = this.sessions[i]
-      if (now - s.lastSeenAt <= this.idleMs) {
-        session = s
-        break
-      }
+      if (now - s.lastSeenAt > this.idleMs) continue
+      if (cwd && s.cwd && cwd !== s.cwd) continue
+      session = s
+      // Backfill: if this is the first request in the session that
+      // actually carries a cwd, lock it onto the session record so
+      // future cwd-bearing requests with a *different* cwd correctly
+      // open a separate session.
+      if (cwd && !s.cwd) s.cwd = cwd
+      break
     }
     let isNewSession = false
     if (!session) {
@@ -164,6 +198,7 @@ export class Grouper {
         sessionId: newId(),
         startedAt: now,
         lastSeenAt: now,
+        cwd,
         messages: [],
       }
       this.sessions.push(session)

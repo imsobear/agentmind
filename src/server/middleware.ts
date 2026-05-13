@@ -50,7 +50,6 @@ function listSessions() {
     // (topic classifier, post-processing) are framework noise; tokens spent
     // on them are real but irrelevant to "what did the agent do".
     const modelOutputTokens = new Map<string, number>()
-    let cwd: string | undefined = session?.cwd
     let mainCount = 0
     let lastMain: CapturedInteraction | undefined
     for (const it of interactions) {
@@ -71,8 +70,8 @@ function listSessions() {
           (modelOutputTokens.get(m) ?? 0) + (u?.output_tokens ?? 0),
         )
       }
-      if (!cwd) cwd = extractCwdFromRequest(it.request)
     }
+    const cwd = resolveSessionCwd(session, interactions)
     let primaryModel = session?.firstSeenModel
     let max = -1
     for (const [m, c] of modelOutputTokens) {
@@ -114,13 +113,35 @@ function extractCwdFromRequest(req: { system?: unknown } | undefined): string | 
   return m?.[1]?.trim() || undefined
 }
 
+// Best-effort cwd resolution for a stored session. JSONL is append-only
+// and the very first request that opens a session sometimes lacks a cwd
+// in its system prompt (typical for haiku title-gen helpers), so the
+// persisted `session.cwd` can be undefined even though later
+// interactions in the same session clearly carry one. Falling back to a
+// scan keeps every UI surface (list / detail) showing the same value.
+function resolveSessionCwd(
+  session: { cwd?: string } | undefined,
+  interactions: CapturedInteraction[],
+): string | undefined {
+  if (session?.cwd) return session.cwd
+  for (const it of interactions) {
+    const cwd = extractCwdFromRequest(it.request)
+    if (cwd) return cwd
+  }
+  return undefined
+}
+
 function getSessionDetail(sessionId: string) {
   const { session, messages, interactions } = storage.loadSession(sessionId)
   if (!session && !messages.length && !interactions.length) return null
   // Aggregate: fold haiku helper calls into the surrounding main agent message
   // so the UI shows one message per user-typed prompt, not one per HTTP round-trip.
   const aggregated = aggregateMessages(messages, interactions, countToolUseBlocks)
-  return { session, messages: aggregated }
+  const cwd = resolveSessionCwd(session, interactions)
+  return {
+    session: session ? { ...session, cwd } : session,
+    messages: aggregated,
+  }
 }
 
 function countToolUseBlocks(it: CapturedInteraction): number {

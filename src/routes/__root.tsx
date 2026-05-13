@@ -1,8 +1,11 @@
+import { Github } from 'lucide-react'
 import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
 
 import appCss from '../styles.css?url'
 import { SessionsSidebar } from '#/components/SessionsSidebar'
 import { MessagesPane } from '#/components/MessagesPane'
+
+const REPO_URL = 'https://github.com/imsobear/claude-proxy-console'
 
 export const Route = createRootRoute({
   head: () => ({
@@ -49,11 +52,28 @@ function ThreePaneShell() {
 }
 
 function Header() {
+  // Fixed min-h on the header containers (matched in MessagesPane) is
+  // what actually locks the left and middle columns to the same
+  // baseline. Once height is structural we're free to pick whatever
+  // typography reads best per column without re-creating the alignment
+  // bug every time one of them changes.
   return (
-    <div className="px-4 py-3 border-b border-border">
-      <div className="font-medium text-sm tracking-tight">claude-proxy</div>
-      <div className="text-[10px] text-muted-foreground tabular-nums mt-0.5">
-        ANTHROPIC_BASE_URL=http://127.0.0.1:8088
+    <div className="px-4 border-b border-border min-h-[60px] flex flex-col justify-center">
+      <div className="flex items-center gap-1.5">
+        <span className="font-medium text-sm tracking-tight">claude-proxy</span>
+        <a
+          href={REPO_URL}
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label="View claude-proxy on GitHub"
+          title="View claude-proxy on GitHub"
+          className="text-muted-foreground hover:text-foreground transition-colors leading-none"
+        >
+          <Github className="w-3.5 h-3.5" />
+        </a>
+      </div>
+      <div className="text-[10px] text-muted-foreground mt-0.5">
+        Local Claude Code traffic inspector
       </div>
     </div>
   )
