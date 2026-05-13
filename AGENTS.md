@@ -47,10 +47,17 @@ Persisted and realtime are decoupled. Both lanes must stay correct:
   last-wins on `interactionId`. Never seek-and-rewrite.
 - **Realtime** — `LiveRegistry` in-process map (lost on restart). The
   proxy feeds every upstream chunk through a `LiveSession`; the
-  `GET /api/sessions/:sid/interactions/:iid/live` SSE endpoint fans
-  throttled (150ms) snapshots to subscribed browsers. The `LiveSession`
-  is created **before** `onEvent` fires so subscribers can't race-miss
-  it.
+  registry re-emits throttled (150ms per iid) `live-update` and
+  terminal `live-done` events. `middleware.ts` multiplexes those —
+  together with `capture` events — onto the single shared
+  `GET /api/events` SSE endpoint. Every browser tab opens **exactly
+  one** SSE connection regardless of how many in-flight cards it has
+  open; without the multiplex we burned through Chrome's per-origin
+  HTTP/1.1 cap (6) almost immediately. The `LiveSession` is created
+  **before** `onEvent` fires so subscribers can't race-miss it, and
+  `getInteraction` splices the current registry snapshot into the
+  initial HTTP fetch so mid-stream tabs paint immediately instead of
+  waiting for the next throttled tick.
 
 When editing `proxy.ts`: **every** early-return / error path must call
 `live.finish()` + `liveRegistry.remove()`, otherwise subscribers hang

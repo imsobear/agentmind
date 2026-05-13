@@ -162,7 +162,7 @@ export function createMessagesProxy(deps: ProxyDeps) {
     // by allocating one even for non-streaming requests; in that case
     // the session is immediately `finish()`ed below with no payload
     // and any racing subscriber gets a clean empty-then-done sequence.
-    const live = liveRegistry.create(interactionId)
+    const live = liveRegistry.create(interactionId, resolution.sessionId)
     onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
 
     // 4. Forward upstream.
