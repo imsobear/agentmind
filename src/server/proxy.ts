@@ -9,7 +9,7 @@ import { request as undiciRequest } from 'undici'
 import type { AnthropicRequest } from '../lib/anthropic-types'
 import { Storage, newId } from './storage'
 import { Grouper } from './grouping'
-import { SseAccumulator } from './sse'
+import { LiveRegistry } from './liveRegistry'
 
 // Hardcoded upstream. The CLAUDE_PROXY_UPSTREAM env override exists for
 // integration testing only — do not surface it in user-facing docs.
@@ -77,12 +77,17 @@ function redact(v: string): string {
 export interface ProxyDeps {
   storage: Storage
   grouper: Grouper
+  // Mutable registry of in-flight streams. The proxy opens an entry on
+  // stream start, feeds it every chunk, and finalises it on completion
+  // — the HTTP layer reads from the same registry to serve live SSE
+  // subscribers without us having to plumb a second event bus.
+  liveRegistry: LiveRegistry
   // signal when a session/message/interaction was captured, for the UI to refresh.
   onEvent?: (e: { kind: 'session' | 'message' | 'interaction'; sessionId: string; id: string }) => void
 }
 
 export function createMessagesProxy(deps: ProxyDeps) {
-  const { storage, grouper, onEvent } = deps
+  const { storage, grouper, liveRegistry, onEvent } = deps
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== 'POST') {
@@ -151,6 +156,13 @@ export function createMessagesProxy(deps: ProxyDeps) {
       request: parsed,
       requestHeaders: safeHeaders,
     })
+    // Register the live slot BEFORE notifying clients so subscribers
+    // racing the partial-record event always find the session — even
+    // if the upstream hasn't returned the first chunk yet. We pessimise
+    // by allocating one even for non-streaming requests; in that case
+    // the session is immediately `finish()`ed below with no payload
+    // and any racing subscriber gets a clean empty-then-done sequence.
+    const live = liveRegistry.create(interactionId)
     onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
 
     // 4. Forward upstream.
@@ -176,6 +188,8 @@ export function createMessagesProxy(deps: ProxyDeps) {
       res.statusCode = 502
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ error: 'upstream_unreachable', message: errMsg }))
+      live.finish({ message: errMsg })
+      liveRegistry.remove(interactionId)
       // Patch interaction with error.
       storage.appendRecord(resolution.sessionId, {
         type: 'interaction',
@@ -213,12 +227,20 @@ export function createMessagesProxy(deps: ProxyDeps) {
 
     if (isStream) {
       // SSE streaming path.
-      const acc = new SseAccumulator()
+      //
+      // The LiveSession (allocated above) owns the SseAccumulator for
+      // this interaction while the stream is in flight; the HTTP layer
+      // (`/api/sessions/:sid/interactions/:iid/live`) reads snapshots
+      // off it and pushes them to any subscribed browser. We remove
+      // the session from the registry once we've persisted the final
+      // record — late `/live` subscribers will then get the canonical
+      // disk record instead.
+      const acc = live.accumulator
       try {
         for await (const chunk of upstream.body) {
           const buf = chunk as Buffer
           const text = buf.toString('utf8')
-          acc.feed(text)
+          live.feed(text)
           // tee to client immediately.
           res.write(buf)
         }
@@ -226,6 +248,8 @@ export function createMessagesProxy(deps: ProxyDeps) {
       } catch (e: any) {
         // upstream broke mid-stream
         const errMsg = e?.message ?? String(e)
+        live.finish({ message: errMsg, status: upstream.statusCode })
+        liveRegistry.remove(interactionId)
         try {
           res.end()
         } catch {}
@@ -248,6 +272,11 @@ export function createMessagesProxy(deps: ProxyDeps) {
         onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
         return
       }
+      // Tell live subscribers we're done BEFORE removing from the
+      // registry so they observe the terminal snapshot through the SSE
+      // channel. The `finish` call emits `done` synchronously.
+      live.finish()
+      liveRegistry.remove(interactionId)
       try {
         res.end()
       } catch {}
@@ -271,11 +300,14 @@ export function createMessagesProxy(deps: ProxyDeps) {
       return
     }
 
-    // Non-streaming path: buffer & parse JSON.
+    // Non-streaming path: buffer & parse JSON. We still close out the
+    // (unused) live slot so any racing /live subscribers don't hang.
     const respChunks: Buffer[] = []
     try {
       for await (const chunk of upstream.body) respChunks.push(chunk as Buffer)
     } catch (e: any) {
+      live.finish({ message: e?.message ?? String(e), status: upstream.statusCode })
+      liveRegistry.remove(interactionId)
       try {
         res.end()
       } catch {}
@@ -296,6 +328,8 @@ export function createMessagesProxy(deps: ProxyDeps) {
       onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
       return
     }
+    live.finish()
+    liveRegistry.remove(interactionId)
     const respBuf = Buffer.concat(respChunks)
     res.end(respBuf)
 

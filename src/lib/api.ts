@@ -116,3 +116,53 @@ export function subscribeEvents(cb: (e: { kind: string; sessionId: string; id: s
   })
   return () => es.close()
 }
+
+// Snapshot of an in-flight interaction. Mirrors the server-side
+// LiveSnapshot shape; sent on every throttled tick over the
+// /api/sessions/:sid/interactions/:iid/live SSE endpoint.
+export interface LiveSnapshot {
+  response?: AnthropicResponse
+  done: boolean
+  error?: { message: string; status?: number }
+}
+
+// Tail snapshots for an in-flight interaction. The server emits one
+// `snapshot` per ~150ms while the stream is live, plus a terminal
+// `done` event when it ends — at which point the caller should drop
+// the subscription and refetch the persisted record. The cleanup
+// function returned here is safe to call multiple times.
+export function subscribeLive(
+  sid: string,
+  iid: string,
+  onSnapshot: (snap: LiveSnapshot) => void,
+  onDone?: () => void,
+): () => void {
+  const url = `/api/sessions/${encodeURIComponent(sid)}/interactions/${encodeURIComponent(iid)}/live`
+  const es = new EventSource(url)
+  let closed = false
+  const close = () => {
+    if (closed) return
+    closed = true
+    try {
+      es.close()
+    } catch {}
+  }
+  es.addEventListener('snapshot', (ev) => {
+    if (closed) return
+    try {
+      onSnapshot(JSON.parse((ev as MessageEvent).data) as LiveSnapshot)
+    } catch {}
+  })
+  es.addEventListener('done', () => {
+    if (closed) return
+    onDone?.()
+    close()
+  })
+  // EventSource will reconnect on transport errors by default; we
+  // don't want runaway retries against a stale endpoint, so we close
+  // on the first hard error.
+  es.addEventListener('error', () => {
+    close()
+  })
+  return close
+}

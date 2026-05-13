@@ -13,7 +13,12 @@ import {
 } from 'lucide-react'
 import JsonView from '@uiw/react-json-view'
 import { vscodeTheme } from '@uiw/react-json-view/vscode'
-import { api, type InteractionStub, type InteractionFull } from '#/lib/api'
+import {
+  api,
+  subscribeLive,
+  type InteractionStub,
+  type InteractionFull,
+} from '#/lib/api'
 import type { SseEvent } from '#/lib/anthropic-types'
 import { Badge } from '#/components/ui/badge'
 import { Card } from '#/components/ui/card'
@@ -45,6 +50,14 @@ export function InteractionCard({
   const [full, setFull] = useState<InteractionFull | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [open, setOpen] = useState(true)
+  // Live-streaming state for the in-flight phase. We hold the latest
+  // partial response separately so that:
+  //   • snapshots that arrive BEFORE the initial getInteraction fetch
+  //     completes are remembered and merged in later,
+  //   • once endedAt lands we naturally fall back to the persisted
+  //     record (which is authoritative — has sseEvents etc).
+  const [livePartial, setLivePartial] = useState<InteractionFull['response'] | null>(null)
+  const isLive = !stub.endedAt
 
   // Refetch whenever the stub changes shape — endedAt transitions from
   // undefined → ISO once the proxy writes the final record (request +
@@ -69,6 +82,58 @@ export function InteractionCard({
       cancelled = true
     }
   }, [open, sessionId, stub.interactionId, stub.endedAt])
+
+  // Live overlay: while the iter is open and hasn't ended yet, tail
+  // the server's LiveRegistry so the response panel populates
+  // incrementally instead of waiting for the persisted final record.
+  // We unsubscribe once endedAt lands or the card collapses; the
+  // server-side `done` event also auto-closes the EventSource. After
+  // unsubscribe we clear `livePartial` so the persisted record (which
+  // is now richer than what we held in memory) is the only source.
+  useEffect(() => {
+    if (!open || !isLive) {
+      setLivePartial(null)
+      return
+    }
+    const close = subscribeLive(sessionId, stub.interactionId, (snap) => {
+      setLivePartial(snap.response ?? null)
+    })
+    return () => {
+      close()
+      setLivePartial(null)
+    }
+  }, [open, isLive, sessionId, stub.interactionId])
+
+  // While the iter is live, tick a millisecond-resolution counter so
+  // the header duration badge updates visibly even when the model is
+  // mid-thought. 250ms is fine-grained enough to feel alive without
+  // re-rendering the world on every animation frame.
+  const [liveTick, setLiveTick] = useState(0)
+  useEffect(() => {
+    if (!isLive) return
+    const id = setInterval(() => setLiveTick((t) => t + 1), 250)
+    return () => clearInterval(id)
+  }, [isLive])
+
+  // The response surfaced to the panels — persisted final response if
+  // we have one, otherwise the latest live snapshot's partial
+  // response. The persisted record wins to avoid flicker when the
+  // final fetch lands.
+  const overlayedFull: InteractionFull | null = full
+    ? full.response
+      ? full
+      : livePartial
+        ? { ...full, response: livePartial }
+        : full
+    : null
+
+  // Live wall-clock duration: when `stub.durationMs` is missing
+  // (interaction hasn't ended yet) we count from `stub.startedAt` so
+  // the badge keeps moving. `liveTick` participates in the deps to
+  // force a re-evaluation every 250ms while live.
+  void liveTick
+  const displayedDurationMs = stub.durationMs
+    ?? (isLive ? Date.now() - new Date(stub.startedAt).getTime() : undefined)
 
   const sseEvents = full?.sseEvents ?? []
   const iterLabel = `iter ${index + 1}/${total}`
@@ -118,16 +183,31 @@ export function InteractionCard({
               cache {fmt(stub.usage.cache_read_input_tokens)}
             </Badge>
           )}
-          {stub.durationMs != null && (
-            <Badge variant="muted" title="duration">
+          {displayedDurationMs != null && (
+            <Badge variant="muted" title={isLive ? 'live duration · ticking' : 'duration'}>
               <Clock className="w-3 h-3" />
-              {formatDuration(stub.durationMs)}
+              {formatDuration(displayedDurationMs)}
             </Badge>
           )}
-          {stub.stopReason && (
-            <Badge variant={stub.stopReason === 'end_turn' ? 'success' : 'warn'}>
-              {stub.stopReason}
+          {isLive ? (
+            // While the upstream is still streaming we replace the
+            // stop_reason badge with a pulsing "streaming" indicator —
+            // the user shouldn't have to wait for the final record to
+            // know the iter is alive.
+            <Badge
+              variant="warn"
+              className="gap-1"
+              title="Upstream is still streaming · response is being assembled live"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-[color:var(--warn)] animate-pulse" />
+              streaming
             </Badge>
+          ) : (
+            stub.stopReason && (
+              <Badge variant={stub.stopReason === 'end_turn' ? 'success' : 'warn'}>
+                {stub.stopReason}
+              </Badge>
+            )
           )}
           {stub.hasError && (
             <Badge variant="danger" className="gap-1">
@@ -146,18 +226,21 @@ export function InteractionCard({
               label="REQUEST"
               timestamp={stub.startedAt}
               chips={
-                full && (
+                overlayedFull && (
                   <RawJsonButton
-                    obj={full.request}
+                    obj={overlayedFull.request}
                     title={`${iterLabel} · raw request JSON`}
                   />
                 )
               }
             />
             {error && <div className="p-4 text-xs text-destructive">{error}</div>}
-            {!error && !full && <div className="p-4 text-xs text-muted-foreground">Loading…</div>}
-            {full && (
-              <RequestPanel interaction={full} prevMessageCount={stub.prevMessageCount ?? 0} />
+            {!error && !overlayedFull && <div className="p-4 text-xs text-muted-foreground">Loading…</div>}
+            {overlayedFull && (
+              <RequestPanel
+                interaction={overlayedFull}
+                prevMessageCount={stub.prevMessageCount ?? 0}
+              />
             )}
           </section>
           <section className="min-w-0">
@@ -166,7 +249,7 @@ export function InteractionCard({
               label="RESPONSE"
               timestamp={stub.endedAt}
               chips={
-                full && (
+                overlayedFull && (
                   <>
                     {sseEvents.length > 0 && (
                       <SseTimelineButton
@@ -175,15 +258,15 @@ export function InteractionCard({
                       />
                     )}
                     <RawJsonButton
-                      obj={full.response ?? full.error ?? {}}
+                      obj={overlayedFull.response ?? overlayedFull.error ?? {}}
                       title={`${iterLabel} · raw response JSON`}
                     />
                   </>
                 )
               }
             />
-            {full && <ResponsePanel interaction={full} />}
-            {!full && !error && (
+            {overlayedFull && <ResponsePanel interaction={overlayedFull} />}
+            {!overlayedFull && !error && (
               <div className="p-4 text-xs text-muted-foreground">Loading…</div>
             )}
           </section>
