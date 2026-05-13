@@ -35,7 +35,7 @@ export function ActionExecutionSegment({ segment }: { segment: ActionSegment }) 
       />
       <button
         onClick={() => setOpen((v) => !v)}
-        className="relative -ml-6 w-full flex items-center gap-2 pl-1 pr-2 py-1 text-left text-[11px] hover:text-foreground transition-colors group"
+        className="relative -ml-6 w-full min-w-0 flex flex-wrap items-center gap-2 pl-1 pr-2 py-1 text-left text-[11px] hover:text-foreground transition-colors group"
       >
         {/* node on the rail */}
         <span className="relative w-4 h-4 rounded-full bg-background border-2 border-[color:var(--tool)]/40 flex items-center justify-center shrink-0">
@@ -117,7 +117,11 @@ function ActionRow({ action, pending }: { action: ActionEntry; pending: boolean 
   return (
     <div
       className={cn(
-        'rounded-md border bg-background/40',
+        // `min-w-0` ensures this row can shrink inside a constrained
+        // pane; without it, the inner `truncate` span on the summary
+        // never kicks in and a long Bash arg / file path runs off the
+        // right edge.
+        'rounded-md border bg-background/40 min-w-0',
         status === 'error' && 'border-destructive/40 bg-destructive/5',
         status === 'unmatched' && 'border-[color:var(--cc)]/40 bg-[color:var(--cc)]/5',
         status === 'pending' && 'border-[color:var(--cc)]/30 bg-[color:var(--cc)]/5',
@@ -126,9 +130,9 @@ function ActionRow({ action, pending }: { action: ActionEntry; pending: boolean 
     >
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted/30 transition-colors"
+        className="w-full min-w-0 flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted/30 transition-colors"
       >
-        <span className="text-muted-foreground">
+        <span className="text-muted-foreground shrink-0">
           {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
         </span>
         <Wrench className="w-3 h-3 text-[color:var(--tool)] shrink-0" />
@@ -136,19 +140,22 @@ function ActionRow({ action, pending }: { action: ActionEntry; pending: boolean 
           {action.name}
         </span>
         {summary && (
-          <span className="text-[11px] text-foreground/80 font-mono truncate min-w-0">
+          <span
+            className="text-[11px] text-foreground/80 font-mono truncate min-w-0 flex-1"
+            title={summary}
+          >
             {summary}
           </span>
         )}
         <span className="ml-auto flex items-center gap-1 shrink-0">
           {action.hasImage && (
-            <Badge variant="info" className="!text-[10px] gap-1" title="result contained an image">
+            <Badge variant="info" className="!text-[10px] gap-1 shrink-0" title="result contained an image">
               <ImageIcon className="w-3 h-3" />
               img
             </Badge>
           )}
           {action.hasToolHydration && (
-            <Badge variant="muted" className="!text-[10px]" title="ToolSearch hydration block">
+            <Badge variant="muted" className="!text-[10px] shrink-0" title="ToolSearch hydration block">
               hydrate
             </Badge>
           )}
