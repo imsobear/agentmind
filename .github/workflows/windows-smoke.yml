@@ -141,11 +141,15 @@ jobs:
             Write-Host "GET $asset => 200"
 
             # 5. GET /api/sessions — capture-API JSON
+            # NOTE: avoid `ConvertFrom-Json` for the emptiness check
+            # because PowerShell pipeline-unwraps an empty array to
+            # $null, which then makes `$null -eq $sessions` true and
+            # we'd mis-report a healthy empty-state as a failure.
+            # Just verify the body literally looks like a JSON array.
             $body = & curl.exe -fsS "$base/api/sessions"
-            if ($LASTEXITCODE -ne 0) { Fail "GET /api/sessions failed" }
-            $sessions = $body | ConvertFrom-Json
-            if ($null -eq $sessions) { Fail "/api/sessions did not return JSON" }
-            Write-Host "GET /api/sessions => 200 ($($sessions.Count) sessions)"
+            if ($LASTEXITCODE -ne 0)       { Fail "GET /api/sessions failed" }
+            if ($body -notmatch '^\s*\[')  { Fail "/api/sessions did not return JSON array, body=$body" }
+            Write-Host "GET /api/sessions => 200 (body=$body)"
 
             # 6. GET /assets/../../package.json — path-traversal MUST be blocked.
             # --path-as-is keeps the literal `..` so the server gets to make the
