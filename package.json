@@ -1,0 +1,65 @@
+{
+  "name": "claude-proxy-cli",
+  "version": "0.1.0",
+  "description": "Local proxy that captures Claude Code traffic and visualises every API/LLM exchange",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "claude-proxy": "./bin/cli.js"
+  },
+  "imports": {
+    "#/*": "./src/*"
+  },
+  "scripts": {
+    "dev": "vite dev --port 8088 --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@radix-ui/react-scroll-area": "^1.2.2",
+    "@radix-ui/react-separator": "^1.1.1",
+    "@radix-ui/react-slot": "^1.1.1",
+    "@tailwindcss/vite": "^4.1.0",
+    "@tanstack/react-router": "^1.167.0",
+    "@tanstack/react-start": "^1.167.0",
+    "@tanstack/router-plugin": "^1.167.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "lucide-react": "^0.577.0",
+    "open": "^10.1.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tailwind-merge": "^3.0.2",
+    "tailwindcss": "^4.1.0",
+    "tw-animate-css": "^1.3.6",
+    "undici": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0",
+    "vite": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin",
+    "src",
+    "vite.config.ts",
+    "tsconfig.json",
+    "components.json"
+  ],
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "lightningcss"
+    ]
+  },
+  "packageManager": "pnpm@10.33.2"
+}
