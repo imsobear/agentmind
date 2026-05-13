@@ -1,15 +1,13 @@
 name: CI
 
-# Runs on every push to a non-main branch and on every PR targeting
-# main. Mirrors the build + typecheck steps from release.yml so a broken
-# release/* branch is caught before merge — without duplicating the
-# publish step.
+# Runs on every push to a non-main branch. The resulting `check` status
+# also surfaces on any PR opened from that branch, so it doubles as the
+# required pre-merge gate without duplicating runs via a `pull_request`
+# trigger.
 
 on:
   push:
     branches-ignore: [main]
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
