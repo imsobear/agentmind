@@ -62,10 +62,8 @@ Install globally if you'd rather not type `npx`:
 
 ```bash
 npm install -g agentmind-cli
-agentmind --help
+agentmind-cli --help
 ```
-
-> The npm package is `agentmind-cli`, but the binary is just `agentmind`.
 
 Flags:
 
@@ -186,7 +184,7 @@ src/
     ├── sse.ts                    Anthropic SSE parser
     └── storage.ts                JSONL persistence
 
-bin/cli.js                        global `agentmind` entry
+bin/cli.js                        global `agentmind-cli` entry
 ```
 
 ## Development
@@ -200,7 +198,7 @@ pnpm start        # run the production bundle locally (no vite)
 ```
 
 The published package ships a prebuilt `dist/` — end users running
-`npx agentmind` never touch vite, tsx, or any dev dependency. The CLI
+`npx agentmind-cli` never touch vite, tsx, or any dev dependency. The CLI
 boots a plain `node:http` server in under 100ms.
 
 Optional env vars (testing/dev only — not user-facing):
