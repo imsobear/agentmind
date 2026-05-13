@@ -53,10 +53,6 @@ export function MessageDetail({ sessionId, messageId }: { sessionId: string; mes
     )
   }
 
-  const preview =
-    message.firstUserText?.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim() ||
-    '(no text)'
-
   return (
     <ScrollArea className="h-full">
       <div className="max-w-4xl mx-auto p-6 pb-24 flex flex-col gap-6">
@@ -74,7 +70,6 @@ export function MessageDetail({ sessionId, messageId }: { sessionId: string; mes
               <Badge variant="warn" className="ml-1">still pending tool_use</Badge>
             )}
           </div>
-          <UserPrompt text={preview} />
           <StatsStrip interactions={message.interactions} />
         </header>
 
@@ -103,17 +98,6 @@ export function MessageDetail({ sessionId, messageId }: { sessionId: string; mes
         </div>
       </div>
     </ScrollArea>
-  )
-}
-
-function UserPrompt({ text }: { text: string }) {
-  return (
-    <div className="rounded-lg border border-[color:var(--user)]/30 bg-[color:var(--user)]/5 p-4">
-      <div className="text-[10px] uppercase tracking-wider text-[color:var(--user)] font-medium mb-2">
-        User prompt
-      </div>
-      <div className="text-sm whitespace-pre-wrap leading-relaxed">{text}</div>
-    </div>
   )
 }
 

@@ -52,7 +52,7 @@ export function ActionExecutionSegment({ segment }: { segment: ActionSegment }) 
             <ChevronRight className="w-3 h-3" />
           )}
           <span className="uppercase tracking-wider font-medium">
-            {segment.pending ? 'Pending actions' : 'Actions'}
+            Execute tools
           </span>
           <Badge
             variant="tool"
@@ -152,7 +152,7 @@ function ActionRow({ action, pending }: { action: ActionEntry; pending: boolean 
               hydrate
             </Badge>
           )}
-          <StatusBadge status={status} chars={action.resultChars} />
+          <StatusBadge status={status} />
         </span>
       </button>
       {open && (
@@ -163,17 +163,7 @@ function ActionRow({ action, pending }: { action: ActionEntry; pending: boolean 
             </pre>
           </Sub>
           {status === 'ok' || status === 'error' ? (
-            <Sub
-              label={isErr ? 'result · error' : 'result'}
-              right={
-                action.resultChars != null ? (
-                  <span className="text-[10px] text-muted-foreground tabular-nums">
-                    {fmtChars(action.resultChars)} chars
-                    {action.resultTruncated && ' · preview truncated'}
-                  </span>
-                ) : null
-              }
-            >
+            <Sub label={isErr ? 'result · error' : 'result'}>
               {action.resultPreview != null && action.resultPreview.length > 0 ? (
                 <pre
                   className={cn(
@@ -213,7 +203,7 @@ function ActionRow({ action, pending }: { action: ActionEntry; pending: boolean 
 
 type StatusKind = 'ok' | 'error' | 'unmatched' | 'pending'
 
-function StatusBadge({ status, chars }: { status: StatusKind; chars?: number }) {
+function StatusBadge({ status }: { status: StatusKind }) {
   if (status === 'error') {
     return (
       <Badge variant="danger" className="!text-[10px] gap-1">
@@ -238,27 +228,23 @@ function StatusBadge({ status, chars }: { status: StatusKind; chars?: number }) 
       </Badge>
     )
   }
-  return (
-    <Badge variant="muted" className="!text-[10px] tabular-nums">
-      ↓ {chars != null ? fmtChars(chars) : '0'}
-    </Badge>
-  )
+  // ok — no badge needed; the absence of any status flag is itself the
+  // "completed successfully" signal, and a bare character count on the
+  // right rail carried no semantic value.
+  return null
 }
 
 function Sub({
   label,
-  right,
   children,
 }: {
   label: string
-  right?: React.ReactNode
   children: React.ReactNode
 }) {
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
-        <span>{label}</span>
-        {right && <span className="ml-auto normal-case tracking-normal">{right}</span>}
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        {label}
       </div>
       {children}
     </div>
@@ -329,8 +315,3 @@ function tryStringify(v: unknown, max = 200): string {
   return s.slice(0, max - 1) + '…'
 }
 
-function fmtChars(n: number): string {
-  if (n < 1000) return String(n)
-  if (n < 1_000_000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'k'
-  return (n / 1_000_000).toFixed(2) + 'M'
-}
