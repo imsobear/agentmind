@@ -1,32 +1,93 @@
 name: Release
 
-# Auto-publishes whatever is in package.json the moment a release/x.y.z
-# branch lands on main. Versions that already exist on npm are skipped,
-# so re-running an already-published commit is a no-op (idempotent).
+# Manual release pipeline. Must be triggered from a `release/x.y.z` branch
+# whose PR into main is already green on the CI workflow.
 #
-# Manual triggers are also allowed for one-off re-runs.
+# Order of operations (publish first, merge after — so main only ever
+# reflects what's already shipped):
+#
+#   1. Validate branch name + package.json version match.
+#   2. Look up the open PR (release/x.y.z → main); refuse if checks
+#      aren't all green or no PR exists.
+#   3. Re-run build + typecheck (defensive; also writes routeTree.gen.ts).
+#   4. Refuse if `agentmind-cli@x.y.z` is already on the registry.
+#   5. `npm publish --provenance`.
+#   6. Squash-merge the PR (branch is auto-deleted by --delete-branch).
+#   7. Tag `vx.y.z` on main + draft a GitHub release.
+#
+# If any earlier step fails the branch stays unmerged and main is
+# untouched — so a botched release is recoverable by fixing the branch
+# and re-running the workflow.
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write       # tag + create GitHub release
-  id-token: write       # required for `npm publish --provenance`
+  contents: write        # tag + GitHub release
+  pull-requests: write   # squash-merge + delete branch
+  id-token: write        # npm --provenance
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate branch + version
+        id: meta
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          if [[ ! "$BRANCH" =~ ^release/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "::error::Release workflow must run on a release/x.y.z branch, got: $BRANCH"
+            exit 1
+          fi
+          VERSION="${BRANCH#release/}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Version mismatch: branch says $VERSION, package.json says $PKG_VERSION"
+            exit 1
+          fi
+          PKG_NAME=$(node -p "require('./package.json').name")
+          echo "branch=$BRANCH"   >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+          echo "name=$PKG_NAME"   >> "$GITHUB_OUTPUT"
+
+      - name: Locate PR & gate on green checks
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER=$(gh pr list \
+            --head "${{ steps.meta.outputs.branch }}" \
+            --base main \
+            --state open \
+            --json number --jq '.[0].number')
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::No open PR found for ${{ steps.meta.outputs.branch }} → main."
+            exit 1
+          fi
+
+          # Reject if any non-Release check is missing or non-success.
+          BAD=$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '
+            [.statusCheckRollup[]
+             | select((.workflowName // "") != "Release")
+             | (.conclusion // "PENDING")]
+            | map(select(. != "SUCCESS" and . != "NEUTRAL" and . != "SKIPPED"))
+            | join(",")
+          ')
+          if [ -n "$BAD" ]; then
+            echo "::error::PR #$PR_NUMBER has non-green checks: $BAD"
+            exit 1
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
       - uses: pnpm/action-setup@v4
         with:
@@ -41,44 +102,39 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # `pnpm build` runs first because vite + @tanstack/router-plugin
-      # is what writes `src/routeTree.gen.ts`. Without that file the
-      # subsequent typecheck cannot resolve any of the route modules.
+      # vite + @tanstack/router-plugin writes src/routeTree.gen.ts, which
+      # tsc needs to resolve the route modules.
       - name: Build
         run: pnpm build
 
       - name: Typecheck
         run: pnpm typecheck
 
-      - name: Read package metadata
-        id: pkg
+      - name: Refuse if version already on npm
         run: |
-          PKG_NAME=$(node -p "require('./package.json').name")
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          echo "name=$PKG_NAME"       >> "$GITHUB_OUTPUT"
-          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$PKG_VERSION"    >> "$GITHUB_OUTPUT"
-
-      - name: Skip if version already published
-        id: gate
-        run: |
-          if npm view "${{ steps.pkg.outputs.name }}@${{ steps.pkg.outputs.version }}" version >/dev/null 2>&1; then
-            echo "Version ${{ steps.pkg.outputs.version }} already on npm — skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+          if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version >/dev/null 2>&1; then
+            echo "::error::${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} is already published — refusing to overwrite."
+            exit 1
           fi
 
       - name: npm publish
-        if: steps.gate.outputs.skip != 'true'
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Tag & GitHub release
-        if: steps.gate.outputs.skip != 'true'
+      - name: Squash-merge PR + delete branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.pr.outputs.number }}" \
+            --squash --delete-branch \
+            --subject "release: ${{ steps.meta.outputs.version }}" \
+            --body "Automated release via Release workflow."
+
+      - name: Tag + GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.pkg.outputs.tag }}
-          name: ${{ steps.pkg.outputs.tag }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          target_commitish: main
           generate_release_notes: true
