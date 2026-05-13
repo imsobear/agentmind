@@ -120,7 +120,9 @@ function SessionRow({ s, active }: { s: SessionListItem; active: boolean }) {
 }
 
 function lastPathSeg(p: string): string {
-  const parts = p.split('/').filter(Boolean)
+  // Split on both `/` and `\` so Windows cwds (`C:\Users\foo\proj`)
+  // render their basename rather than dumping the entire path.
+  const parts = p.split(/[/\\]/).filter(Boolean)
   return parts[parts.length - 1] ?? p
 }
 

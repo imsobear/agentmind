@@ -90,8 +90,15 @@ if (useProd) {
   // Dev: spawn vite. Only viable when bin/cli.js sits next to the
   // source tree (i.e. you ran `pnpm link --global` from a checkout, or
   // you're using `pnpm dev` directly).
-  const viteBin = resolve(projectRoot, 'node_modules', '.bin', 'vite')
-  if (!existsSync(viteBin)) {
+  //
+  // We invoke vite's JS entry via process.execPath instead of the
+  // platform-specific shim under node_modules/.bin. On Windows that
+  // shim is `vite.cmd`, which (a) existsSync misses if you check for
+  // a `vite` (no-extension) file, and (b) Node's spawn won't execute
+  // a `.cmd` without `shell: true` + escaping gymnastics. Driving the
+  // raw JS through node is identical on macOS / Linux / Windows.
+  const viteEntry = resolve(projectRoot, 'node_modules', 'vite', 'bin', 'vite.js')
+  if (!existsSync(viteEntry)) {
     process.stderr.write(
       `agentmind-cli: dist/agentmind/cli.mjs missing and vite not installed.\n` +
         `If you're hacking on agentmind, run \`pnpm install && pnpm build\` first.\n`,
@@ -99,7 +106,7 @@ if (useProd) {
     process.exit(1)
   }
   const viteArgs = ['dev', '--host', host, '--port', String(port)]
-  const child = spawn(viteBin, viteArgs, {
+  const child = spawn(process.execPath, [viteEntry, ...viteArgs], {
     cwd: projectRoot,
     stdio: ['inherit', 'pipe', 'inherit'],
     env: process.env,

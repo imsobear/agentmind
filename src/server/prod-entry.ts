@@ -18,7 +18,7 @@ import {
   existsSync,
   statSync,
 } from 'node:fs'
-import { dirname, extname, join, resolve, normalize } from 'node:path'
+import { dirname, extname, isAbsolute, join, posix, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
@@ -83,9 +83,20 @@ function tryServeStatic(pathname: string, res: ServerResponse): boolean {
   if (safe === '/' || !safe.startsWith('/')) return false
   // Strip query (already stripped upstream usually, but be defensive).
   safe = safe.split('?')[0]
-  // Path-traversal guard via `normalize` + prefix check.
-  const candidate = normalize(join(clientDir, safe))
-  if (!candidate.startsWith(clientDir + (clientDir.endsWith('/') ? '' : '/'))) return false
+  // Normalize as a POSIX URL path so `..` segments collapse identically
+  // on every host OS — then a relative-check against clientDir catches
+  // anything that still tries to escape. The previous version compared
+  // a `normalize()`d path against `clientDir + '/'`; on Windows that
+  // literal `/` never matches the `\` separator, which made *every*
+  // static asset request 404. Hence the explicit `posix.normalize`
+  // here.
+  const normalized = posix.normalize(safe)
+  if (normalized.startsWith('../') || normalized === '..' || normalized.startsWith('/..')) {
+    return false
+  }
+  const candidate = join(clientDir, normalized)
+  const rel = relative(clientDir, candidate)
+  if (rel.startsWith('..') || isAbsolute(rel)) return false
   if (!existsSync(candidate)) return false
   const stat = statSync(candidate)
   if (!stat.isFile()) return false
