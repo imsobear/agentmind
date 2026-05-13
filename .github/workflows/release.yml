@@ -1,115 +1,97 @@
 name: Release
 
-# This workflow IS the required `release` status check that auto-merge
-# waits on before squash-merging a release/x.y.z → main PR.
+# Runs on every push to main (i.e. immediately after a PR squash-merges).
+# If package.json's version isn't already on npm, publishes + tags + drafts
+# a GitHub release. Otherwise it's a no-op, so non-release merges (docs,
+# refactors, etc.) just exit cleanly without doing anything.
 #
-# Behavior:
-#
-#   - Non-release-branch PR (e.g. docs/foo → main):
-#       Job-level `if` is false → job is SKIPPED → GitHub treats the
-#       required check as passing → PR can merge with just CI green.
-#
-#   - release/x.y.z → main PR, auto-merge NOT yet enabled:
-#       Job runs. First step explicitly fails with a clear message.
-#       Required `release` check goes red. PR cannot merge.
-#
-#   - release/x.y.z → main PR, auto-merge enabled:
-#       Job runs all the way. Validates branch ↔ version, re-builds,
-#       re-typechecks, refuses if version is already on npm, then
-#       `npm publish --provenance`. Job succeeds → `release` check
-#       green → GitHub's auto-merge squashes the PR and deletes the
-#       branch.
-#
-# Triggers also include `synchronize` so that any push to the head
-# branch after auto-merge is enabled forces a re-publish (otherwise the
-# stale green `release` check from a prior SHA would let stale code
-# auto-merge).
+# CI (build + typecheck) is a required status check on PRs, so most
+# publish failures are caught before merge. If publish still fails here,
+# fix forward: bump version, open a new release/x.y.(z+1) PR.
 
 on:
-  pull_request:
+  push:
     branches: [main]
-    types: [opened, reopened, synchronize, auto_merge_enabled]
+  workflow_dispatch:
 
 permissions:
-  contents: read
-  pull-requests: read
-  id-token: write     # required for `npm publish --provenance`
+  contents: write       # tag + create GitHub release
+  id-token: write       # required for `npm publish --provenance`
 
 concurrency:
-  group: release-${{ github.event.pull_request.number }}
+  group: release
   cancel-in-progress: false
 
 jobs:
   release:
-    # Non-release branches bypass the whole thing — they don't need to
-    # publish anything.
-    if: startsWith(github.event.pull_request.head.ref, 'release/')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      # Hard fail — and therefore a red `release` check — whenever
-      # someone tries to publish without auto-merge being on. This is
-      # what forces the operator into the "click Enable auto-merge"
-      # flow rather than direct-merging.
-      - name: Require auto-merge to be enabled
-        if: ${{ github.event.pull_request.auto_merge == null }}
-        run: |
-          echo "::error::Auto-merge is not enabled on this PR."
-          echo "::error::Click 'Enable auto-merge (squash)' on the PR to trigger publish + merge."
-          exit 1
-
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
-      - name: Validate branch ↔ version
+      - name: Resolve package metadata
         id: meta
         run: |
-          BRANCH="${{ github.event.pull_request.head.ref }}"
-          if [[ ! "$BRANCH" =~ ^release/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "::error::head branch must be release/x.y.z (got: $BRANCH)"
-            exit 1
-          fi
-          VERSION="${BRANCH#release/}"
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "$VERSION" != "$PKG_VERSION" ]; then
-            echo "::error::version mismatch: branch=$VERSION, package.json=$PKG_VERSION"
-            exit 1
-          fi
           PKG_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "name=$PKG_NAME"   >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already published
+        id: gate
+        run: |
+          if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version >/dev/null 2>&1; then
+            echo "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} already on npm — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - uses: pnpm/action-setup@v4
+        if: steps.gate.outputs.skip == 'false'
         with:
           version: 10.33.2
 
       - uses: actions/setup-node@v4
+        if: steps.gate.outputs.skip == 'false'
         with:
           node-version: '20'
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
+        if: steps.gate.outputs.skip == 'false'
         run: pnpm install --frozen-lockfile
 
       # vite + @tanstack/router-plugin writes src/routeTree.gen.ts, which
       # tsc needs to resolve the route modules.
       - name: Build
+        if: steps.gate.outputs.skip == 'false'
         run: pnpm build
 
       - name: Typecheck
+        if: steps.gate.outputs.skip == 'false'
         run: pnpm typecheck
 
-      - name: Refuse if version already on npm
-        run: |
-          if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version >/dev/null 2>&1; then
-            echo "::error::${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} is already on the registry — refusing to overwrite."
-            exit 1
-          fi
-
       - name: npm publish
+        if: steps.gate.outputs.skip == 'false'
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag + GitHub release
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.meta.outputs.tag }}" -m "${{ steps.meta.outputs.tag }}"
+          git push origin "${{ steps.meta.outputs.tag }}"
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --generate-notes

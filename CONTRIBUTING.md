@@ -3,23 +3,21 @@
 ## Branch model
 
 - `main` is protected: no direct pushes, ever. Everything lands via PR.
-- Two **required status checks** gate every PR into main:
-  - `check` — produced by the **CI** workflow (build + typecheck).
-  - `release` — produced by the **Release** workflow (npm publish).
+- The **CI** workflow (`build` + `typecheck`) is a required status check
+  on PRs to main, so the "Merge" button only becomes available once it
+  passes.
 - Day-to-day work happens on `release/x.y.z` branches. `x.y.z` is the
-  version the work is targeting — keep it in sync with `package.json`'s
+  version being shipped — keep it in sync with `package.json`'s
   `version` field.
-- `main` is treated as **a log of what has shipped**: a commit only lands
-  on main once the corresponding npm version is already live.
 
-## Release flow (one button on the PR)
+## Release flow
 
-Conceptual sequence: `CI → click "Enable auto-merge" → npm publish → PR
-auto-merges → branch auto-deleted → tag vX.Y.Z`. All three workflows
-participate.
+`push → CI → click Merge → push-to-main fires Release → npm publish + tag`.
+CI being green before merge keeps publish failures rare; if publish does
+fail, fix forward with a new `release/x.y.(z+1)` PR.
 
 ```bash
-# 1. Branch off main; bake the next version into the branch name.
+# 1. Branch off main, baking the next version into the branch name.
 git checkout main && git pull
 git checkout -b release/0.2.0
 
@@ -30,37 +28,20 @@ git checkout -b release/0.2.0
 git push -u origin release/0.2.0
 gh pr create --base main --title "Release 0.2.0" --body "…"
 
-# 4. Wait for the `check` status (CI: build + typecheck) to go green on
-#    the PR. The `release` status will go RED — that's by design; it's
-#    telling you "publish hasn't run yet, so this PR isn't allowed to
-#    merge yet."
+# 4. Wait for `CI / check` to go green. Click "Squash and merge".
 
-# 5. On the PR, click "Enable auto-merge" and pick "Squash and merge".
-#    From here, no further human action is needed:
-#      a. The Release workflow runs, re-verifies the branch ↔ version,
-#         re-builds, re-typechecks, refuses if 0.2.0 is already on npm,
-#         and `npm publish --provenance`s the package.
-#      b. The `release` status goes green.
-#      c. GitHub's auto-merge sees both required checks green and
-#         squash-merges the PR; the release branch is auto-deleted.
-#      d. The Tag workflow tags `v0.2.0` on main and drafts a GitHub
-#         release with auto-generated notes.
-
-# 6. If publish fails, `release` stays red. Auto-merge keeps waiting.
-#    Fix the branch, push, and the Release workflow re-runs on
-#    `synchronize`. main is untouched until publish actually succeeds.
+# 5. On push-to-main, the Release workflow:
+#      - reads version from package.json
+#      - skips silently if that version is already on npm (so docs/
+#        refactor merges that don't bump version are no-ops)
+#      - otherwise: build + typecheck (defensive), npm publish, tag
+#        v0.2.0, draft a GitHub release with auto-generated notes
 ```
 
-## How publishes are gated
+## Secrets
 
-| Check | Workflow | Behavior |
-| --- | --- | --- |
-| `check` | `ci.yml` | build + typecheck on every non-main push and every PR to main |
-| `release` | `release.yml` | for `release/x.y.z → main` PRs only: red until auto-merge is enabled, green once `npm publish` succeeds. For other PRs the job is skipped (counted as passing). |
-
-Non-release PRs (docs, refactors, etc.) merge with just `check` green
-because `release` is skipped for them. Only `release/x.y.z` branches
-are forced through the publish gate.
+`NPM_TOKEN` (Repository → Settings → Secrets and variables → Actions):
+an automation token from npm with publish rights for `agentmind-cli`.
 
 ## Local development
 
