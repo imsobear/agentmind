@@ -55,7 +55,7 @@ export function MessageDetail({ sessionId, messageId }: { sessionId: string; mes
 
   return (
     <ScrollArea className="h-full">
-      <div className="max-w-4xl mx-auto p-6 pb-24 flex flex-col gap-6">
+      <div className="p-6 pb-24 flex flex-col gap-6">
         <header className="flex flex-col gap-2">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <span className="tabular-nums">Message #{message.index + 1}</span>

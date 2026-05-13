@@ -76,7 +76,7 @@ Flags:
 ## The three panes
 
 <div align="center">
-  <img src="docs/images/expanded.png" alt="Expanded request / response view" width="100%" />
+  <img src="docs/images/hero.png" alt="Expanded request / response view" width="100%" />
 </div>
 
 1. **Projects** _(left)_ — one card per `cwd` you ran an agent in. Cards
@@ -94,13 +94,6 @@ Flags:
      between two API calls. Tool name, arguments, duration, success/error.
    - **RESPONSE** — `thinking`, `text`, `tool_use` blocks rendered as the
      model emitted them, with token counts and stop reason.
-
-Click the `{ }` icon in any panel header to pop open a **collapsible JSON
-viewer** with the raw request/response body:
-
-<div align="center">
-  <img src="docs/images/json-dialog.png" alt="Raw JSON inspector with collapsible nodes" width="100%" />
-</div>
 
 ## Live streaming
 
@@ -198,10 +191,15 @@ bin/cli.js                        global `agentmind` entry
 
 ```bash
 pnpm install
-pnpm dev          # http://127.0.0.1:8088 with HMR
+pnpm dev          # http://127.0.0.1:8088 with HMR (uses vite)
 pnpm typecheck    # strict tsc --noEmit
-pnpm build        # production bundle
+pnpm build        # produces dist/ — what npm publishes
+pnpm start        # run the production bundle locally (no vite)
 ```
+
+The published package ships a prebuilt `dist/` — end users running
+`npx agentmind` never touch vite, tsx, or any dev dependency. The CLI
+boots a plain `node:http` server in under 100ms.
 
 Optional env vars (testing/dev only — not user-facing):
 
@@ -217,7 +215,6 @@ Optional env vars (testing/dev only — not user-facing):
 - [ ] Cross-session search & filters
 - [ ] Diff view between adjacent iterations' `messages` arrays
 - [ ] Shareable "trace bundles" (export a sanitized session as a tarball)
-- [ ] Prebuilt Nitro deployment so the CLI starts in <100ms
 
 ## Contributing
 

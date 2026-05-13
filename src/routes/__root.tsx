@@ -41,7 +41,7 @@ function ThreePaneShell() {
         <Header />
         <SessionsSidebar />
       </aside>
-      <section className="w-[340px] shrink-0 border-r border-border flex flex-col">
+      <section className="w-[260px] shrink-0 border-r border-border flex flex-col">
         <MessagesPane />
       </section>
       <main className="flex-1 min-w-0 overflow-hidden">
