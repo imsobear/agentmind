@@ -131,21 +131,30 @@ export type ContentDelta =
   | { type: 'input_json_delta'; partial_json: string }
 
 // ── Captured records (what we write to JSONL) ────────────────────────────────
+//
+// One JSONL file per project (cwd-keyed). A project file's first line is a
+// `CapturedProject` record; subsequent lines are messages and interactions.
+//
+// On READ we also accept legacy `{type:"session", sessionId}` records — that
+// was the original schema before we collapsed time-based session buckets
+// into cwd-based projects. The storage layer translates them into project
+// records in memory so the rest of the codebase only ever sees the new
+// shape.
 
-export interface CapturedSession {
-  type: 'session'
-  sessionId: string
-  startedAt: string // ISO
+export interface CapturedProject {
+  type: 'project'
+  projectId: string
+  startedAt: string // ISO — first time we saw this cwd
   firstSeenModel?: string
-  cwd?: string // extracted from system prompt if available
+  cwd?: string // extracted from system prompt of the first request
   proxyVersion: string
 }
 
 export interface CapturedMessage {
   type: 'message'
   messageId: string
-  sessionId: string
-  index: number // 0-based in session
+  projectId: string
+  index: number // 0-based in project
   startedAt: string
   firstUserText?: string // for sidebar preview
 }
@@ -153,7 +162,7 @@ export interface CapturedMessage {
 export interface CapturedInteraction {
   type: 'interaction'
   interactionId: string
-  sessionId: string
+  projectId: string
   messageId: string
   index: number // 0-based within message
   startedAt: string
@@ -171,4 +180,4 @@ export interface CapturedInteraction {
   error?: { message: string; status?: number }
 }
 
-export type CapturedRecord = CapturedSession | CapturedMessage | CapturedInteraction
+export type CapturedRecord = CapturedProject | CapturedMessage | CapturedInteraction

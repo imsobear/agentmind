@@ -73,7 +73,7 @@ const MIME: Record<string, string> = {
 function tryServeStatic(pathname: string, res: ServerResponse): boolean {
   // Hashed asset paths (e.g. /assets/index-DHaF7x8N.js) live under
   // dist/client/assets — anything else routes to SSR so client-side
-  // routes like /sessions/:id still hit the React app.
+  // routes like /projects/:id still hit the React app.
   let safe = pathname
   try {
     safe = decodeURIComponent(safe)

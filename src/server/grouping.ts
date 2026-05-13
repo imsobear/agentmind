@@ -1,30 +1,26 @@
-// Session + Message inference from Anthropic Messages API requests.
+// Project + Message inference from Anthropic Messages API requests.
 //
-// Claude Code does not send a session-id header. We never know which `claude`
-// process the request came from. So we infer:
+// Claude Code does not send a project- or session-id header. We never
+// know which `claude` process the request came from. So we infer:
 //
-// SESSION
-//   A run of `claude` typically fires many API calls in quick succession —
-//   not just the main agent's ReAct iterations, but also background calls
-//   (a Haiku for title generation, another for topic classification, …).
-//   These all share a single user-perceived "claude session".
+// PROJECT
+//   One project per working-directory. The `claude` process running in
+//   /foo/bar always belongs to project hash("/foo/bar"), regardless of
+//   how many times it's restarted, regardless of how long ago the
+//   previous run finished. This makes the URL stable for bookmarks and
+//   matches the user's mental model — "this is the project I'm working
+//   on in /foo/bar".
 //
-//   Primary key is the working-directory the `claude` process is running
-//   in, recovered best-effort from the system prompt. Two simultaneously
-//   running `claude` invocations in different directories therefore never
-//   collide into one session. Within a directory we still need a time
-//   bound — the user could `claude … && later … claude …` from the same
-//   shell — so we additionally require the previous request in that cwd
-//   to be within an IDLE WINDOW.
-//
-//   Some requests (helper haiku title-gen, classifier, etc.) don't expose
-//   their cwd in the system prompt. Those requests fall back to "any live
-//   session within the idle window" and will attach to the most recent
-//   one. That keeps the helpers grouped with their parent agent even
-//   though we can't see their cwd directly.
+//   The cwd is best-effort recovered from the system prompt. A few
+//   helper requests (haiku title-gen, topic classifier, summariser…)
+//   don't expose their cwd because their system prompt is too sparse;
+//   we attach those to whichever project most recently received a
+//   cwd-bearing request from this proxy process. They invariably arrive
+//   alongside their parent agent's main call, so "most recent cwd" is a
+//   safe attribution.
 //
 // MESSAGE
-//   Within a session, two requests belong to the same "message" iff
+//   Within a project, two requests belong to the same "message" iff
 //     1. the older request's `messages` array is a prefix of the newer one's,
 //        AND
 //     2. the slice that was appended does NOT contain a new user-typed prompt
@@ -38,6 +34,7 @@
 //   message → each opens a fresh message too.
 
 import type { AnthropicRequest, MessageParam } from '../lib/anthropic-types'
+import { projectIdForCwd } from './projectId'
 
 interface Message {
   messageId: string
@@ -51,27 +48,28 @@ interface Message {
   interactionCount: number
 }
 
-interface Session {
-  sessionId: string
+interface Project {
+  projectId: string
   startedAt: number
-  lastSeenAt: number
-  // The working directory the `claude` process was started in, recovered
-  // from the system prompt of the first request that managed to expose
-  // it. May stay undefined for sessions composed entirely of helper
-  // calls (rare but possible).
-  cwd: string | undefined
+  // The working directory recovered from the first cwd-bearing request.
+  // Always present after the first such request — undefined only for
+  // brand-new in-process state before any cwd has been seen.
+  cwd: string
   messages: Message[]
 }
 
 export interface GroupResolution {
-  sessionId: string
+  projectId: string
   messageId: string
-  isNewSession: boolean
+  isNewProject: boolean
   isNewMessage: boolean
   messageIndex: number
   interactionIndex: number
   firstUserText?: string
   isFirstCall: boolean
+  // The cwd we ultimately attributed the request to. Useful for the
+  // proxy when it writes the `project` header record on first sight.
+  cwd: string
 }
 
 function isUserPromptMessage(m: MessageParam): boolean {
@@ -153,15 +151,42 @@ function isPrefixOf(prev: MessageParam[], next: MessageParam[]): boolean {
   return true
 }
 
-export class Grouper {
-  private sessions: Session[] = []
-  private readonly idleMs: number
+// Snapshot of an existing project on disk, supplied by the Storage
+// layer at Grouper cold-miss time so message indices keep increasing
+// across proxy restarts (the projectId is now deterministic from cwd,
+// so two runs in the same directory all append to the same file —
+// without rehydration the second run's "iter 1" would re-use index 0).
+export interface ProjectHydration {
+  cwd: string
+  messages: Array<{
+    messageId: string
+    index: number
+    lastMessages: MessageParam[]
+    userPromptCount: number
+    interactionCount: number
+  }>
+}
 
-  constructor(opts: { idleMs?: number } = {}) {
-    // 3 minutes is long enough to cover any conceivable in-CLI gap (model
-    // streaming, slow tool execution) and short enough that two distinct
-    // claude invocations rarely overlap. Override via constructor.
-    this.idleMs = opts.idleMs ?? 3 * 60 * 1000
+export interface GrouperDeps {
+  // Called on first sight of a cwd in this process. Return any messages
+  // already persisted for that cwd so subsequent indices continue from
+  // there. Returning `undefined` (project not on disk) opens a fresh
+  // project starting at message index 0.
+  hydrate?: (cwd: string) => ProjectHydration | undefined
+}
+
+export class Grouper {
+  // Keyed by cwd. Resolution is O(1) — no scan, no time window.
+  private projects = new Map<string, Project>()
+  // Last cwd we routed a request to. Helper calls without their own cwd
+  // (haiku title-gen etc.) attach to this. Empty before the first
+  // cwd-bearing request — those rare leading helpers go to a synthetic
+  // "_orphan_" project to avoid dropping them on the floor.
+  private lastCwd: string | undefined
+  private readonly deps: GrouperDeps
+
+  constructor(deps: GrouperDeps = {}) {
+    this.deps = deps
   }
 
   resolve(
@@ -170,46 +195,32 @@ export class Grouper {
     newId: () => string,
     cwd: string | undefined,
   ): GroupResolution {
-    // ── pick / open session
-    //
-    // Walk newest-first. A session matches when:
-    //   • it's still within the idle window, AND
-    //   • the cwds are compatible — either both sides agree, or at least
-    //     one side hasn't yet learned its cwd.
-    // The "at least one side undefined" case is what lets helper haiku
-    // calls (which lack cwd in their slim system prompt) attach to the
-    // same session as their parent agent.
-    let session: Session | undefined
-    for (let i = this.sessions.length - 1; i >= 0; i--) {
-      const s = this.sessions[i]
-      if (now - s.lastSeenAt > this.idleMs) continue
-      if (cwd && s.cwd && cwd !== s.cwd) continue
-      session = s
-      // Backfill: if this is the first request in the session that
-      // actually carries a cwd, lock it onto the session record so
-      // future cwd-bearing requests with a *different* cwd correctly
-      // open a separate session.
-      if (cwd && !s.cwd) s.cwd = cwd
-      break
-    }
-    let isNewSession = false
-    if (!session) {
-      session = {
-        sessionId: newId(),
-        startedAt: now,
-        lastSeenAt: now,
-        cwd,
-        messages: [],
-      }
-      this.sessions.push(session)
-      isNewSession = true
-    }
-    session.lastSeenAt = now
+    const resolvedCwd = cwd ?? this.lastCwd ?? '_orphan_'
 
-    // ── pick / open message inside session
+    let project = this.projects.get(resolvedCwd)
+    let isNewProject = false
+    if (!project) {
+      // Cold miss in this process — but the cwd's project file may
+      // already exist on disk from previous runs. Pull the persisted
+      // message chain so we extend it rather than starting fresh.
+      const hydration = this.deps.hydrate?.(resolvedCwd)
+      project = {
+        projectId: projectIdForCwd(resolvedCwd),
+        startedAt: now,
+        cwd: resolvedCwd,
+        messages: hydration?.messages.map((m) => ({ ...m })) ?? [],
+      }
+      this.projects.set(resolvedCwd, project)
+      // Only mark as new when there's nothing on disk yet — that's the
+      // signal proxy.ts uses to write the `project` header record.
+      isNewProject = !hydration
+    }
+    if (cwd) this.lastCwd = cwd
+
+    // ── pick / open message inside project
     const reqUserPrompts = countUserPrompts(req.messages)
     let message: Message | undefined
-    for (const m of session.messages) {
+    for (const m of project.messages) {
       if (m.userPromptCount !== reqUserPrompts) continue
       if (isPrefixOf(m.lastMessages, req.messages)) {
         message = m
@@ -220,12 +231,12 @@ export class Grouper {
     if (!message) {
       message = {
         messageId: newId(),
-        index: session.messages.length,
+        index: project.messages.length,
         lastMessages: req.messages,
         userPromptCount: reqUserPrompts,
         interactionCount: 0,
       }
-      session.messages.push(message)
+      project.messages.push(message)
       isNewMessage = true
     } else {
       // extension: update lastMessages
@@ -247,22 +258,23 @@ export class Grouper {
     }
 
     return {
-      sessionId: session.sessionId,
+      projectId: project.projectId,
       messageId: message.messageId,
       messageIndex: message.index,
-      isNewSession,
+      isNewProject,
       isNewMessage,
       interactionIndex,
       firstUserText: preview,
       isFirstCall: req.messages.length === 1 && req.messages[0]?.role === 'user',
+      cwd: resolvedCwd,
     }
   }
 
   snapshot() {
-    return this.sessions.map((s) => ({
-      sessionId: s.sessionId,
-      messageCount: s.messages.length,
-      lastSeenAt: s.lastSeenAt,
+    return Array.from(this.projects.values()).map((p) => ({
+      projectId: p.projectId,
+      cwd: p.cwd,
+      messageCount: p.messages.length,
     }))
   }
 }

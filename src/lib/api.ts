@@ -6,14 +6,14 @@ import type {
   AnthropicResponse,
   CapturedInteraction,
   CapturedMessage,
-  CapturedSession,
+  CapturedProject,
   SseEvent,
   StopReason,
   Usage,
 } from './anthropic-types'
 
-export interface SessionListItem {
-  sessionId: string
+export interface ProjectListItem {
+  projectId: string
   startedAt?: string
   cwd?: string
   model?: string
@@ -77,8 +77,8 @@ export interface MessageWithInteractions extends CapturedMessage {
   actionSegments: ActionSegment[]
 }
 
-export interface SessionDetail {
-  session?: CapturedSession
+export interface ProjectDetail {
+  project?: CapturedProject
   messages: MessageWithInteractions[]
 }
 
@@ -98,11 +98,11 @@ async function getJson<T>(path: string): Promise<T> {
 }
 
 export const api = {
-  listSessions: () => getJson<SessionListItem[]>('/api/sessions'),
-  getSession: (id: string) => getJson<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`),
-  getInteraction: (sid: string, iid: string) =>
+  listProjects: () => getJson<ProjectListItem[]>('/api/projects'),
+  getProject: (id: string) => getJson<ProjectDetail>(`/api/projects/${encodeURIComponent(id)}`),
+  getInteraction: (pid: string, iid: string) =>
     getJson<InteractionFull>(
-      `/api/sessions/${encodeURIComponent(sid)}/interactions/${encodeURIComponent(iid)}`,
+      `/api/projects/${encodeURIComponent(pid)}/interactions/${encodeURIComponent(iid)}`,
     ),
 }
 
@@ -120,7 +120,7 @@ export interface LiveSnapshot {
 // Every browser tab used to open one EventSource per `subscribeEvents`
 // caller AND one per open in-flight InteractionCard (the `/live`
 // endpoint). With three components each calling `subscribeEvents` and
-// any non-trivial session having several streaming iters, a single tab
+// any non-trivial project having several streaming iters, a single tab
 // would hold 6+ SSE connections at once — pinning Chrome's HTTP/1.1
 // per-origin cap and queueing normal fetches behind them.
 //
@@ -130,13 +130,13 @@ export interface LiveSnapshot {
 // `subscribeLive` calls register filtering listeners on top.
 
 export interface CaptureEvent {
-  kind: 'session' | 'message' | 'interaction'
-  sessionId: string
+  kind: 'project' | 'message' | 'interaction'
+  projectId: string
   id: string
 }
 
-type LiveUpdatePayload = { iid: string; sid: string; snapshot: LiveSnapshot }
-type LiveDonePayload = { iid: string; sid: string }
+type LiveUpdatePayload = { iid: string; pid: string; snapshot: LiveSnapshot }
+type LiveDonePayload = { iid: string; pid: string }
 
 let sharedSource: EventSource | null = null
 const captureListeners = new Set<(e: CaptureEvent) => void>()
@@ -185,7 +185,7 @@ function ensureSharedSource(): EventSource {
   return es
 }
 
-// Subscribe to capture (session/message/interaction created) events.
+// Subscribe to capture (project/message/interaction created) events.
 // Returns an unsubscribe function. Safe to call multiple times.
 export function subscribeEvents(cb: (e: CaptureEvent) => void) {
   ensureSharedSource()
@@ -201,7 +201,7 @@ export function subscribeEvents(cb: (e: CaptureEvent) => void) {
 // persisted record for the authoritative final shape. The returned
 // cleanup is idempotent.
 export function subscribeLive(
-  _sid: string,
+  _pid: string,
   iid: string,
   onSnapshot: (snap: LiveSnapshot) => void,
   onDone?: () => void,

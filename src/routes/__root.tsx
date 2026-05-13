@@ -2,7 +2,7 @@ import { Github } from 'lucide-react'
 import { HeadContent, Outlet, Scripts, createRootRoute } from '@tanstack/react-router'
 
 import appCss from '../styles.css?url'
-import { SessionsSidebar } from '#/components/SessionsSidebar'
+import { ProjectsSidebar } from '#/components/ProjectsSidebar'
 import { MessagesPane } from '#/components/MessagesPane'
 
 const REPO_URL = 'https://github.com/imsobear/agentmind'
@@ -42,7 +42,7 @@ function ThreePaneShell() {
     <div className="flex h-dvh w-dvw overflow-hidden bg-background text-foreground">
       <aside className="w-[280px] shrink-0 border-r border-border flex flex-col">
         <Header />
-        <SessionsSidebar />
+        <ProjectsSidebar />
       </aside>
       <section className="w-[260px] shrink-0 border-r border-border flex flex-col">
         <MessagesPane />

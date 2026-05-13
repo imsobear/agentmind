@@ -41,7 +41,7 @@ Use it to:
   inherits.
 - **Learn how good agents are built** — flip through Claude Code's real
   prompts and tool definitions, side-by-side with the responses they produce.
-- **Replay a session offline** — everything is captured as plain JSONL on
+- **Replay a project offline** — everything is captured as plain JSONL on
   your disk; no telemetry, no account, no cloud.
 
 ## Quick start
@@ -70,7 +70,7 @@ Flags:
 | Flag             | Default       | Notes                                      |
 | ---------------- | ------------- | ------------------------------------------ |
 | `--port <n>`     | `8088`        | Listen port (and the proxy URL claude uses) |
-| `--data <dir>`   | `~/.agentmind` | Where the JSONL sessions live              |
+| `--data <dir>`   | `~/.agentmind` | Where the JSONL projects live              |
 | `--no-open`      | _off_         | Skip the auto-open browser step            |
 
 ## The three panes
@@ -109,15 +109,17 @@ All capture is local-first JSONL — never leaves your machine.
 
 ```
 ~/.agentmind/
-└── sessions/
-    └── <sessionId>.jsonl
+└── projects/
+    └── <projectId>.jsonl     # projectId = sha256(cwd).slice(0,16)
 ```
 
-Each file is append-only, one JSON record per line:
+One file per cwd — every `claude` run in the same directory, across
+days and proxy restarts, appends to the same file. Each line is one
+JSON record:
 
 | `type`        | When written                              | Purpose                          |
 | ------------- | ----------------------------------------- | -------------------------------- |
-| `session`     | first time a `cwd` is seen                | session metadata                 |
+| `project`     | first time a `cwd` is seen                | project metadata                 |
 | `message`     | once per user prompt                      | groups iterations                |
 | `interaction` | twice per HTTP round-trip (start + final) | last-wins merge on `interactionId` |
 
@@ -160,11 +162,11 @@ roadmap so we can extend the same UI to OpenAI-shaped traffic.
 src/
 ├── routes/                       file-based routes
 │   ├── __root.tsx                three-pane shell + header
-│   ├── sessions.$sid.tsx         session column wiring
-│   └── sessions.$sid.messages.$mid.tsx
+│   ├── projects.$pid.tsx         project column wiring
+│   └── projects.$pid.messages.$mid.tsx
 │                                 message detail (the inspector)
 ├── components/
-│   ├── SessionsSidebar.tsx       left pane (projects)
+│   ├── ProjectsSidebar.tsx       left pane (projects)
 │   ├── MessagesPane.tsx          middle pane (prompts)
 │   ├── MessageDetail.tsx         right pane wrapper
 │   ├── InteractionCard.tsx       one HTTP round-trip card
@@ -212,9 +214,9 @@ Optional env vars (testing/dev only — not user-facing):
 ## Roadmap
 
 - [ ] OpenAI Responses API capture (Codex CLI, OpenCode)
-- [ ] Cross-session search & filters
+- [ ] Cross-project search & filters
 - [ ] Diff view between adjacent iterations' `messages` arrays
-- [ ] Shareable "trace bundles" (export a sanitized session as a tarball)
+- [ ] Shareable "trace bundles" (export a sanitized project as a tarball)
 
 ## Contributing
 

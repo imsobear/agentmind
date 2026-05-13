@@ -82,8 +82,8 @@ export interface ProxyDeps {
   // — the HTTP layer reads from the same registry to serve live SSE
   // subscribers without us having to plumb a second event bus.
   liveRegistry: LiveRegistry
-  // signal when a session/message/interaction was captured, for the UI to refresh.
-  onEvent?: (e: { kind: 'session' | 'message' | 'interaction'; sessionId: string; id: string }) => void
+  // signal when a project/message/interaction was captured, for the UI to refresh.
+  onEvent?: (e: { kind: 'project' | 'message' | 'interaction'; projectId: string; id: string }) => void
 }
 
 export function createMessagesProxy(deps: ProxyDeps) {
@@ -118,38 +118,38 @@ export function createMessagesProxy(deps: ProxyDeps) {
     const interactionId = newId()
     const startedAtIso = new Date(now).toISOString()
 
-    // 2. Persist session/message records if new.
-    if (resolution.isNewSession) {
-      storage.appendRecord(resolution.sessionId, {
-        type: 'session',
-        sessionId: resolution.sessionId,
+    // 2. Persist project/message records if new.
+    if (resolution.isNewProject) {
+      storage.appendRecord(resolution.projectId, {
+        type: 'project',
+        projectId: resolution.projectId,
         startedAt: startedAtIso,
         firstSeenModel: parsed.model,
-        cwd,
+        cwd: resolution.cwd,
         proxyVersion: PROXY_VERSION,
       })
-      onEvent?.({ kind: 'session', sessionId: resolution.sessionId, id: resolution.sessionId })
+      onEvent?.({ kind: 'project', projectId: resolution.projectId, id: resolution.projectId })
     }
     if (resolution.isNewMessage) {
-      storage.appendRecord(resolution.sessionId, {
+      storage.appendRecord(resolution.projectId, {
         type: 'message',
         messageId: resolution.messageId,
-        sessionId: resolution.sessionId,
+        projectId: resolution.projectId,
         index: resolution.messageIndex,
         startedAt: startedAtIso,
         firstUserText: resolution.firstUserText,
       })
-      onEvent?.({ kind: 'message', sessionId: resolution.sessionId, id: resolution.messageId })
+      onEvent?.({ kind: 'message', projectId: resolution.projectId, id: resolution.messageId })
     }
 
     const forwardHeaders = pickForwardHeaders(req)
     const safeHeaders = safeRequestHeaders(forwardHeaders)
 
     // 3. Persist a partial interaction record so the UI sees it immediately.
-    storage.appendRecord(resolution.sessionId, {
+    storage.appendRecord(resolution.projectId, {
       type: 'interaction',
       interactionId,
-      sessionId: resolution.sessionId,
+      projectId: resolution.projectId,
       messageId: resolution.messageId,
       index: resolution.interactionIndex,
       startedAt: startedAtIso,
@@ -157,13 +157,14 @@ export function createMessagesProxy(deps: ProxyDeps) {
       requestHeaders: safeHeaders,
     })
     // Register the live slot BEFORE notifying clients so subscribers
-    // racing the partial-record event always find the session — even
+    // racing the partial-record event always find the project — even
     // if the upstream hasn't returned the first chunk yet. We pessimise
     // by allocating one even for non-streaming requests; in that case
-    // the session is immediately `finish()`ed below with no payload
-    // and any racing subscriber gets a clean empty-then-done sequence.
-    const live = liveRegistry.create(interactionId, resolution.sessionId)
-    onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
+    // the project's live slot is immediately `finish()`ed below with no
+    // payload and any racing subscriber gets a clean empty-then-done
+    // sequence.
+    const live = liveRegistry.create(interactionId, resolution.projectId)
+    onEvent?.({ kind: 'interaction', projectId: resolution.projectId, id: interactionId })
 
     // 4. Forward upstream.
     let upstream
@@ -191,10 +192,10 @@ export function createMessagesProxy(deps: ProxyDeps) {
       live.finish({ message: errMsg })
       liveRegistry.remove(interactionId)
       // Patch interaction with error.
-      storage.appendRecord(resolution.sessionId, {
+      storage.appendRecord(resolution.projectId, {
         type: 'interaction',
         interactionId,
-        sessionId: resolution.sessionId,
+        projectId: resolution.projectId,
         messageId: resolution.messageId,
         index: resolution.interactionIndex,
         startedAt: startedAtIso,
@@ -204,7 +205,7 @@ export function createMessagesProxy(deps: ProxyDeps) {
         requestHeaders: safeHeaders,
         error: { message: errMsg },
       })
-      onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
+      onEvent?.({ kind: 'interaction', projectId: resolution.projectId, id: interactionId })
       return
     }
 
@@ -230,11 +231,10 @@ export function createMessagesProxy(deps: ProxyDeps) {
       //
       // The LiveSession (allocated above) owns the SseAccumulator for
       // this interaction while the stream is in flight; the HTTP layer
-      // (`/api/sessions/:sid/interactions/:iid/live`) reads snapshots
-      // off it and pushes them to any subscribed browser. We remove
-      // the session from the registry once we've persisted the final
-      // record — late `/live` subscribers will then get the canonical
-      // disk record instead.
+      // pushes its throttled snapshots to subscribers over the shared
+      // /api/events SSE channel. We remove the session from the
+      // registry once we've persisted the final record — late
+      // subscribers will then get the canonical disk record instead.
       const acc = live.accumulator
       try {
         for await (const chunk of upstream.body) {
@@ -253,10 +253,10 @@ export function createMessagesProxy(deps: ProxyDeps) {
         try {
           res.end()
         } catch {}
-        storage.appendRecord(resolution.sessionId, {
+        storage.appendRecord(resolution.projectId, {
           type: 'interaction',
           interactionId,
-          sessionId: resolution.sessionId,
+          projectId: resolution.projectId,
           messageId: resolution.messageId,
           index: resolution.interactionIndex,
           startedAt: startedAtIso,
@@ -269,7 +269,7 @@ export function createMessagesProxy(deps: ProxyDeps) {
           response: acc.getResponse(),
           error: { message: errMsg, status: upstream.statusCode },
         })
-        onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
+        onEvent?.({ kind: 'interaction', projectId: resolution.projectId, id: interactionId })
         return
       }
       // Tell live subscribers we're done BEFORE removing from the
@@ -281,10 +281,10 @@ export function createMessagesProxy(deps: ProxyDeps) {
         res.end()
       } catch {}
       // Finalise.
-      storage.appendRecord(resolution.sessionId, {
+      storage.appendRecord(resolution.projectId, {
         type: 'interaction',
         interactionId,
-        sessionId: resolution.sessionId,
+        projectId: resolution.projectId,
         messageId: resolution.messageId,
         index: resolution.interactionIndex,
         startedAt: startedAtIso,
@@ -296,12 +296,12 @@ export function createMessagesProxy(deps: ProxyDeps) {
         sseEvents: acc.events,
         response: acc.getResponse(),
       })
-      onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
+      onEvent?.({ kind: 'interaction', projectId: resolution.projectId, id: interactionId })
       return
     }
 
     // Non-streaming path: buffer & parse JSON. We still close out the
-    // (unused) live slot so any racing /live subscribers don't hang.
+    // (unused) live slot so any racing live subscribers don't hang.
     const respChunks: Buffer[] = []
     try {
       for await (const chunk of upstream.body) respChunks.push(chunk as Buffer)
@@ -311,10 +311,10 @@ export function createMessagesProxy(deps: ProxyDeps) {
       try {
         res.end()
       } catch {}
-      storage.appendRecord(resolution.sessionId, {
+      storage.appendRecord(resolution.projectId, {
         type: 'interaction',
         interactionId,
-        sessionId: resolution.sessionId,
+        projectId: resolution.projectId,
         messageId: resolution.messageId,
         index: resolution.interactionIndex,
         startedAt: startedAtIso,
@@ -325,7 +325,7 @@ export function createMessagesProxy(deps: ProxyDeps) {
         responseHeaders: upstreamHeaders,
         error: { message: e?.message ?? String(e), status: upstream.statusCode },
       })
-      onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
+      onEvent?.({ kind: 'interaction', projectId: resolution.projectId, id: interactionId })
       return
     }
     live.finish()
@@ -339,10 +339,10 @@ export function createMessagesProxy(deps: ProxyDeps) {
     } catch {
       parsedResp = undefined
     }
-    storage.appendRecord(resolution.sessionId, {
+    storage.appendRecord(resolution.projectId, {
       type: 'interaction',
       interactionId,
-      sessionId: resolution.sessionId,
+      projectId: resolution.projectId,
       messageId: resolution.messageId,
       index: resolution.interactionIndex,
       startedAt: startedAtIso,
@@ -354,7 +354,7 @@ export function createMessagesProxy(deps: ProxyDeps) {
       response: parsedResp && parsedResp.type === 'message' ? parsedResp : undefined,
       error: upstream.statusCode >= 400 ? { message: respBuf.toString('utf8').slice(0, 1024), status: upstream.statusCode } : undefined,
     })
-    onEvent?.({ kind: 'interaction', sessionId: resolution.sessionId, id: interactionId })
+    onEvent?.({ kind: 'interaction', projectId: resolution.projectId, id: interactionId })
   }
 }
 

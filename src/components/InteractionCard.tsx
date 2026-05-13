@@ -37,12 +37,12 @@ import { ResponsePanel } from '#/components/ResponsePanel'
 import { formatDuration } from '#/components/MessageDetail'
 
 export function InteractionCard({
-  sessionId,
+  projectId,
   stub,
   index,
   total,
 }: {
-  sessionId: string
+  projectId: string
   stub: InteractionStub
   index: number
   total: number
@@ -71,7 +71,7 @@ export function InteractionCard({
     if (!open) return
     let cancelled = false
     api
-      .getInteraction(sessionId, stub.interactionId)
+      .getInteraction(projectId, stub.interactionId)
       .then((d) => {
         if (!cancelled) setFull(d)
       })
@@ -81,7 +81,7 @@ export function InteractionCard({
     return () => {
       cancelled = true
     }
-  }, [open, sessionId, stub.interactionId, stub.endedAt])
+  }, [open, projectId, stub.interactionId, stub.endedAt])
 
   // Live overlay: while the iter is open and hasn't ended yet, tail
   // the server's LiveRegistry so the response panel populates
@@ -95,14 +95,14 @@ export function InteractionCard({
       setLivePartial(null)
       return
     }
-    const close = subscribeLive(sessionId, stub.interactionId, (snap) => {
+    const close = subscribeLive(projectId, stub.interactionId, (snap) => {
       setLivePartial(snap.response ?? null)
     })
     return () => {
       close()
       setLivePartial(null)
     }
-  }, [open, isLive, sessionId, stub.interactionId])
+  }, [open, isLive, projectId, stub.interactionId])
 
   // While the iter is live, tick a millisecond-resolution counter so
   // the header duration badge updates visibly even when the model is

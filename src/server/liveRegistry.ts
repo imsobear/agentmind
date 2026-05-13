@@ -43,13 +43,13 @@ export class LiveSession {
   readonly emitter: EventEmitter
   done = false
   error?: { message: string; status?: number }
-  // The session (cwd-keyed group) this interaction belongs to. We need
+  // The project (cwd-keyed group) this interaction belongs to. We need
   // it so registry-level emits can carry it without consumers having
-  // to keep a separate iid → sid map.
-  readonly sessionId: string
+  // to keep a separate iid → projectId map.
+  readonly projectId: string
 
-  constructor(sessionId: string) {
-    this.sessionId = sessionId
+  constructor(projectId: string) {
+    this.projectId = projectId
     this.accumulator = new SseAccumulator()
     this.emitter = new EventEmitter()
     // Multiple browser tabs may subscribe to the same in-flight
@@ -85,13 +85,13 @@ export class LiveSession {
 
 export interface LiveUpdateEvent {
   iid: string
-  sid: string
+  pid: string
   snapshot: LiveSnapshot
 }
 
 export interface LiveDoneEvent {
   iid: string
-  sid: string
+  pid: string
 }
 
 // Per-iid throttle window. 150ms is the same value we used in the
@@ -112,11 +112,11 @@ export class LiveRegistry extends EventEmitter {
     this.setMaxListeners(0)
   }
 
-  create(interactionId: string, sessionId: string): LiveSession {
+  create(interactionId: string, projectId: string): LiveSession {
     // `create` is idempotent only insofar as the caller wouldn't reuse
     // an interactionId — they're freshly minted UUIDs in proxy.ts so we
     // assume no collisions and overwrite if one ever exists.
-    const session = new LiveSession(sessionId)
+    const session = new LiveSession(projectId)
     this.sessions.set(interactionId, session)
 
     session.emitter.on('update', () => this.scheduleEmit(interactionId))
@@ -164,7 +164,7 @@ export class LiveRegistry extends EventEmitter {
     this.emitUpdate(iid)
     const live = this.sessions.get(iid)
     if (!live) return
-    const ev: LiveDoneEvent = { iid, sid: live.sessionId }
+    const ev: LiveDoneEvent = { iid, pid: live.projectId }
     this.emit('live-done', ev)
   }
 
@@ -173,7 +173,7 @@ export class LiveRegistry extends EventEmitter {
     if (!live) return
     const ev: LiveUpdateEvent = {
       iid,
-      sid: live.sessionId,
+      pid: live.projectId,
       snapshot: live.snapshot(),
     }
     this.emit('live-update', ev)
