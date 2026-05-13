@@ -31,8 +31,9 @@ git push -u origin release/0.2.0
 gh pr create --base main --title "Release 0.2.0" --body "…"
 
 # 4. Wait for the `check` status (CI: build + typecheck) to go green on
-#    the PR. The `release` status will still show "pending / expected"
-#    — that's by design.
+#    the PR. The `release` status will go RED — that's by design; it's
+#    telling you "publish hasn't run yet, so this PR isn't allowed to
+#    merge yet."
 
 # 5. On the PR, click "Enable auto-merge" and pick "Squash and merge".
 #    From here, no further human action is needed:
@@ -52,14 +53,14 @@ gh pr create --base main --title "Release 0.2.0" --body "…"
 
 ## How publishes are gated
 
-| Check | Workflow | Trigger |
+| Check | Workflow | Behavior |
 | --- | --- | --- |
-| `check` | `ci.yml` | every non-main push and every PR to main |
-| `release` | `release.yml` | only when auto-merge has been enabled on a `release/x.y.z → main` PR |
+| `check` | `ci.yml` | build + typecheck on every non-main push and every PR to main |
+| `release` | `release.yml` | for `release/x.y.z → main` PRs only: red until auto-merge is enabled, green once `npm publish` succeeds. For other PRs the job is skipped (counted as passing). |
 
-The `release` check is intentionally absent until you opt-in via
-"Enable auto-merge". That keeps random PRs from triggering an npm
-publish on every push.
+Non-release PRs (docs, refactors, etc.) merge with just `check` green
+because `release` is skipped for them. Only `release/x.y.z` branches
+are forced through the publish gate.
 
 ## Local development
 
