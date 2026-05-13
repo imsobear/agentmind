@@ -1,0 +1,44 @@
+name: CI
+
+# Runs on every push to a non-main branch. The resulting `check` status
+# also surfaces on any PR opened from that branch, so it doubles as the
+# required pre-merge gate without duplicating runs via a `pull_request`
+# trigger.
+
+on:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # vite + @tanstack/router-plugin writes src/routeTree.gen.ts, which
+      # tsc needs to resolve the route modules.
+      - name: Build
+        run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck

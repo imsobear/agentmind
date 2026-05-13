@@ -3,31 +3,45 @@
 ## Branch model
 
 - `main` is protected: no direct pushes, ever. Everything lands via PR.
+- The **CI** workflow (`build` + `typecheck`) is a required status check
+  on PRs to main, so the "Merge" button only becomes available once it
+  passes.
 - Day-to-day work happens on `release/x.y.z` branches. `x.y.z` is the
-  version the work is targeting — keep it in sync with `package.json`'s
+  version being shipped — keep it in sync with `package.json`'s
   `version` field.
-- When a `release/x.y.z` PR merges into `main`, GitHub Actions builds,
-  typechecks, publishes `agentmind-cli@x.y.z` to npm, tags `vx.y.z`, and
-  drafts a GitHub release.
-- If `x.y.z` already exists on npm, the publish step is skipped — re-merging
-  is safe.
 
 ## Release flow
 
+`push → CI → click Merge → push-to-main fires Release → npm publish + tag`.
+CI being green before merge keeps publish failures rare; if publish does
+fail, fix forward with a new `release/x.y.(z+1)` PR.
+
 ```bash
-# 1. Branch off main with the next version baked into the name
+# 1. Branch off main, baking the next version into the branch name.
 git checkout main && git pull
 git checkout -b release/0.2.0
 
-# 2. Bump package.json and commit your changes
-#    (use `pnpm version <patch|minor|major> --no-git-tag-version` if you like)
+# 2. Bump package.json version and commit your changes.
+#    (Optional helper: pnpm version <patch|minor|major> --no-git-tag-version)
 
-# 3. Push and open a PR into main
+# 3. Push and open a PR into main.
 git push -u origin release/0.2.0
 gh pr create --base main --title "Release 0.2.0" --body "…"
 
-# 4. After review, merge. The Release workflow publishes 0.2.0 automatically.
+# 4. Wait for `CI / check` to go green. Click "Squash and merge".
+
+# 5. On push-to-main, the Release workflow:
+#      - reads version from package.json
+#      - skips silently if that version is already on npm (so docs/
+#        refactor merges that don't bump version are no-ops)
+#      - otherwise: build + typecheck (defensive), npm publish, tag
+#        v0.2.0, draft a GitHub release with auto-generated notes
 ```
+
+## Secrets
+
+`NPM_TOKEN` (Repository → Settings → Secrets and variables → Actions):
+an automation token from npm with publish rights for `agentmind-cli`.
 
 ## Local development
 

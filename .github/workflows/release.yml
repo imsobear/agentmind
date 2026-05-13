@@ -1,10 +1,13 @@
 name: Release
 
-# Auto-publishes whatever is in package.json the moment a release/x.y.z
-# branch lands on main. Versions that already exist on npm are skipped,
-# so re-running an already-published commit is a no-op (idempotent).
+# Runs on every push to main (i.e. immediately after a PR squash-merges).
+# If package.json's version isn't already on npm, publishes + tags + drafts
+# a GitHub release. Otherwise it's a no-op, so non-release merges (docs,
+# refactors, etc.) just exit cleanly without doing anything.
 #
-# Manual triggers are also allowed for one-off re-runs.
+# CI (build + typecheck) is a required status check on PRs, so most
+# publish failures are caught before merge. If publish still fails here,
+# fix forward: bump version, open a new release/x.y.(z+1) PR.
 
 on:
   push:
@@ -20,62 +23,75 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Resolve package metadata
+        id: meta
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          echo "name=$PKG_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already published
+        id: gate
+        run: |
+          if npm view "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }}" version >/dev/null 2>&1; then
+            echo "${{ steps.meta.outputs.name }}@${{ steps.meta.outputs.version }} already on npm — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: pnpm/action-setup@v4
+        if: steps.gate.outputs.skip == 'false'
         with:
           version: 10.33.2
 
       - uses: actions/setup-node@v4
+        if: steps.gate.outputs.skip == 'false'
         with:
           node-version: '20'
           cache: pnpm
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies
+        if: steps.gate.outputs.skip == 'false'
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm typecheck
-
+      # vite + @tanstack/router-plugin writes src/routeTree.gen.ts, which
+      # tsc needs to resolve the route modules.
       - name: Build
+        if: steps.gate.outputs.skip == 'false'
         run: pnpm build
 
-      - name: Read package metadata
-        id: pkg
-        run: |
-          PKG_NAME=$(node -p "require('./package.json').name")
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          echo "name=$PKG_NAME"       >> "$GITHUB_OUTPUT"
-          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$PKG_VERSION"    >> "$GITHUB_OUTPUT"
-
-      - name: Skip if version already published
-        id: gate
-        run: |
-          if npm view "${{ steps.pkg.outputs.name }}@${{ steps.pkg.outputs.version }}" version >/dev/null 2>&1; then
-            echo "Version ${{ steps.pkg.outputs.version }} already on npm — skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Typecheck
+        if: steps.gate.outputs.skip == 'false'
+        run: pnpm typecheck
 
       - name: npm publish
-        if: steps.gate.outputs.skip != 'true'
+        if: steps.gate.outputs.skip == 'false'
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Tag & GitHub release
-        if: steps.gate.outputs.skip != 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.pkg.outputs.tag }}
-          name: ${{ steps.pkg.outputs.tag }}
-          generate_release_notes: true
+      - name: Tag + GitHub release
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.meta.outputs.tag }}" -m "${{ steps.meta.outputs.tag }}"
+          git push origin "${{ steps.meta.outputs.tag }}"
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --generate-notes
