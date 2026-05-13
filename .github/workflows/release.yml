@@ -1,0 +1,81 @@
+name: Release
+
+# Auto-publishes whatever is in package.json the moment a release/x.y.z
+# branch lands on main. Versions that already exist on npm are skipped,
+# so re-running an already-published commit is a no-op (idempotent).
+#
+# Manual triggers are also allowed for one-off re-runs.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write       # tag + create GitHub release
+  id-token: write       # required for `npm publish --provenance`
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Read package metadata
+        id: pkg
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          echo "name=$PKG_NAME"       >> "$GITHUB_OUTPUT"
+          echo "version=$PKG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$PKG_VERSION"    >> "$GITHUB_OUTPUT"
+
+      - name: Skip if version already published
+        id: gate
+        run: |
+          if npm view "${{ steps.pkg.outputs.name }}@${{ steps.pkg.outputs.version }}" version >/dev/null 2>&1; then
+            echo "Version ${{ steps.pkg.outputs.version }} already on npm — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: npm publish
+        if: steps.gate.outputs.skip != 'true'
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag & GitHub release
+        if: steps.gate.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          name: ${{ steps.pkg.outputs.tag }}
+          generate_release_notes: true
