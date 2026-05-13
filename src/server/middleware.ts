@@ -4,7 +4,15 @@
 //   GET  /api/sessions         → session list
 //   GET  /api/sessions/:id     → session detail (messages + interaction stubs)
 //   GET  /api/sessions/:id/interactions/:iid → full interaction record
-//   GET  /api/events           → SSE stream of capture events (for UI live refresh)
+//   GET  /api/events           → SSE multiplexer:
+//                                  `capture`     — session/message/interaction created
+//                                  `live-update` — throttled partial-response snapshot for an iid
+//                                  `live-done`   — terminal event for an iid
+//
+// Everything that used to need its own SSE connection — both the
+// per-tab capture stream AND the per-card live tail — goes over this
+// single endpoint now, so each browser tab consumes exactly one
+// long-lived connection out of Chrome's 6-per-origin HTTP/1.1 pool.
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEmitter } from 'node:events'
@@ -12,7 +20,7 @@ import { Storage } from './storage'
 import { Grouper } from './grouping'
 import { createMessagesProxy } from './proxy'
 import { aggregateMessages, isMainInteraction } from './aggregate'
-import { LiveRegistry } from './liveRegistry'
+import { LiveRegistry, type LiveUpdateEvent, type LiveDoneEvent } from './liveRegistry'
 import type { CapturedInteraction } from '../lib/anthropic-types'
 
 // Singletons — middleware lives for the lifetime of the dev server.
@@ -156,7 +164,22 @@ function countToolUseBlocks(it: CapturedInteraction): number {
 
 function getInteraction(sessionId: string, interactionId: string) {
   const { interactions } = storage.loadSession(sessionId)
-  return interactions.find((i) => i.interactionId === interactionId) ?? null
+  const it = interactions.find((i) => i.interactionId === interactionId)
+  if (!it) return null
+  // While the interaction is still streaming the JSONL only has the
+  // partial (request-only) record, but the LiveRegistry holds the
+  // accumulated response so far. Splice it in here so a tab opening
+  // the card mid-stream sees whatever has already been emitted, instead
+  // of waiting until the next throttled `live-update` tick on the
+  // shared SSE channel for its first paint.
+  if (!it.endedAt) {
+    const live = liveRegistry.get(interactionId)
+    if (live) {
+      const snap = live.snapshot()
+      if (snap.response) return { ...it, response: snap.response }
+    }
+  }
+  return it
 }
 
 const VERBOSE = process.env.AGENTMIND_VERBOSE !== '0'
@@ -208,21 +231,40 @@ export function createCaptureMiddleware() {
       return
     }
 
-    // /api/events — SSE stream of capture events
+    // /api/events — SSE multiplexer (see header comment).
     if (urlPath === '/api/events') {
       res.statusCode = 200
       res.setHeader('content-type', 'text/event-stream')
       res.setHeader('cache-control', 'no-store')
       res.setHeader('connection', 'keep-alive')
       res.flushHeaders?.()
-      const onEvent = (e: any) => {
-        res.write(`event: capture\ndata: ${JSON.stringify(e)}\n\n`)
+
+      const safeWrite = (chunk: string) => {
+        try {
+          res.write(chunk)
+        } catch {
+          // Connection already closed by the client / runtime — the
+          // `close` cleanup below will detach listeners; ignore here.
+        }
       }
-      events.on('event', onEvent)
-      const heartbeat = setInterval(() => res.write(':keep-alive\n\n'), 15_000)
+      const onCapture = (e: any) => {
+        safeWrite(`event: capture\ndata: ${JSON.stringify(e)}\n\n`)
+      }
+      const onLiveUpdate = (e: LiveUpdateEvent) => {
+        safeWrite(`event: live-update\ndata: ${JSON.stringify(e)}\n\n`)
+      }
+      const onLiveDone = (e: LiveDoneEvent) => {
+        safeWrite(`event: live-done\ndata: ${JSON.stringify(e)}\n\n`)
+      }
+      events.on('event', onCapture)
+      liveRegistry.on('live-update', onLiveUpdate)
+      liveRegistry.on('live-done', onLiveDone)
+      const heartbeat = setInterval(() => safeWrite(':keep-alive\n\n'), 15_000)
       req.on('close', () => {
         clearInterval(heartbeat)
-        events.off('event', onEvent)
+        events.off('event', onCapture)
+        liveRegistry.off('live-update', onLiveUpdate)
+        liveRegistry.off('live-done', onLiveDone)
       })
       return
     }
@@ -256,100 +298,6 @@ export function createCaptureMiddleware() {
       return
     }
 
-    // /api/sessions/:id/interactions/:iid/live  (SSE)
-    //
-    // While the upstream is streaming we hold the partial response in
-    // the LiveRegistry; this endpoint tails that state. Once the
-    // upstream finishes we emit a final `done` event and close — the
-    // client falls back to the persisted /interactions/:iid record for
-    // the authoritative final shape.
-    const liveMatch = urlPath.match(
-      /^\/api\/sessions\/([^/]+)\/interactions\/([^/]+)\/live$/,
-    )
-    if (liveMatch) {
-      const iid = decodeURIComponent(liveMatch[2])
-      streamLive(res, iid)
-      return
-    }
-
     notFound(res)
   }
-}
-
-// Stream live snapshots for one in-flight interaction. Always responds
-// with a 200 text/event-stream so the browser's EventSource doesn't
-// enter an automatic-reconnect loop when the interaction has already
-// completed (registry miss) — we just emit a single `done` event and
-// close in that case.
-function streamLive(res: ServerResponse, interactionId: string) {
-  res.statusCode = 200
-  res.setHeader('content-type', 'text/event-stream')
-  res.setHeader('cache-control', 'no-store')
-  res.setHeader('connection', 'keep-alive')
-  res.flushHeaders?.()
-
-  const session = liveRegistry.get(interactionId)
-  if (!session) {
-    res.write(`event: done\ndata: {}\n\n`)
-    try {
-      res.end()
-    } catch {}
-    return
-  }
-
-  // Throttle snapshot writes: SseAccumulator's `update` fires once per
-  // upstream chunk which can be every few bytes for the model. 150ms
-  // is fast enough to feel real-time and slow enough that the browser
-  // doesn't drown in JSON parsing.
-  const THROTTLE_MS = 150
-  let pendingTimer: ReturnType<typeof setTimeout> | null = null
-  let lastSent = 0
-  function writeSnapshot() {
-    const snap = session!.snapshot()
-    res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`)
-    lastSent = Date.now()
-  }
-  function scheduleSnapshot() {
-    if (pendingTimer) return
-    const wait = Math.max(0, THROTTLE_MS - (Date.now() - lastSent))
-    pendingTimer = setTimeout(() => {
-      pendingTimer = null
-      writeSnapshot()
-    }, wait)
-  }
-
-  // Initial snapshot so the client has something to render
-  // immediately, even before the first delta after subscribing.
-  writeSnapshot()
-
-  const onUpdate = () => scheduleSnapshot()
-  const onDone = () => {
-    // Flush any pending throttled snapshot, then emit terminal events.
-    if (pendingTimer) {
-      clearTimeout(pendingTimer)
-      pendingTimer = null
-    }
-    writeSnapshot()
-    res.write(`event: done\ndata: {}\n\n`)
-    try {
-      res.end()
-    } catch {}
-  }
-  session.emitter.on('update', onUpdate)
-  session.emitter.on('done', onDone)
-
-  // Heartbeats so proxies / network stacks don't drop the connection
-  // mid-stream on quiet model responses.
-  const heartbeat = setInterval(() => {
-    try {
-      res.write(`:keep-alive\n\n`)
-    } catch {}
-  }, 15_000)
-
-  res.req.on('close', () => {
-    session.emitter.off('update', onUpdate)
-    session.emitter.off('done', onDone)
-    if (pendingTimer) clearTimeout(pendingTimer)
-    clearInterval(heartbeat)
-  })
 }

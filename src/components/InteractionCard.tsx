@@ -115,16 +115,20 @@ export function InteractionCard({
     return () => clearInterval(id)
   }, [isLive])
 
-  // The response surfaced to the panels — persisted final response if
-  // we have one, otherwise the latest live snapshot's partial
-  // response. The persisted record wins to avoid flicker when the
-  // final fetch lands.
+  // The response surfaced to the panels:
+  //   • Live: prefer `livePartial` (freshest snapshot). The server-side
+  //     getInteraction splices the current registry snapshot into the
+  //     initial fetch so late-mount cards still have something to
+  //     show *before* the first live-update tick on the shared SSE
+  //     channel — that's what `full.response` provides as a fallback
+  //     until `livePartial` lands.
+  //   • Done: the persisted record is authoritative.
   const overlayedFull: InteractionFull | null = full
-    ? full.response
-      ? full
-      : livePartial
+    ? isLive
+      ? livePartial
         ? { ...full, response: livePartial }
         : full
+      : full
     : null
 
   // Live wall-clock duration: when `stub.durationMs` is missing

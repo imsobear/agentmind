@@ -8,12 +8,19 @@
 // closes.
 //
 // The LiveRegistry is the parallel hot-path: while a stream is in
-// flight we keep an SseAccumulator alive here and notify subscribers
-// via an EventEmitter as new chunks arrive. The middleware exposes
-// this through `/api/sessions/:sid/interactions/:iid/live`. Once the
-// upstream finishes (success or error) we mark the session done; the
-// HTTP layer flushes a final snapshot + `done` event and clients fall
-// back to the canonical persisted record.
+// flight we keep an SseAccumulator alive here and re-emit two
+// throttled events back to whatever is listening at the registry
+// level:
+//
+//   - `live-update {iid, sid, snapshot}`  (≤ once per 150ms per iid)
+//   - `live-done   {iid, sid}`            (terminal — fires once)
+//
+// `middleware.ts` subscribes to *those* registry events and multiplexes
+// them out over the shared `/api/events` SSE so every tab needs only
+// ONE long-lived connection regardless of how many in-flight cards it
+// has open. Without this multiplexing the browser quickly burned
+// through Chrome's per-origin HTTP/1.1 cap (6) and choked normal
+// fetches.
 
 import { EventEmitter } from 'node:events'
 import { SseAccumulator } from './sse'
@@ -36,8 +43,13 @@ export class LiveSession {
   readonly emitter: EventEmitter
   done = false
   error?: { message: string; status?: number }
+  // The session (cwd-keyed group) this interaction belongs to. We need
+  // it so registry-level emits can carry it without consumers having
+  // to keep a separate iid → sid map.
+  readonly sessionId: string
 
-  constructor() {
+  constructor(sessionId: string) {
+    this.sessionId = sessionId
     this.accumulator = new SseAccumulator()
     this.emitter = new EventEmitter()
     // Multiple browser tabs may subscribe to the same in-flight
@@ -71,16 +83,46 @@ export class LiveSession {
   }
 }
 
-export class LiveRegistry {
-  private sessions = new Map<string, LiveSession>()
+export interface LiveUpdateEvent {
+  iid: string
+  sid: string
+  snapshot: LiveSnapshot
+}
 
-  create(interactionId: string): LiveSession {
+export interface LiveDoneEvent {
+  iid: string
+  sid: string
+}
+
+// Per-iid throttle window. 150ms is the same value we used in the
+// dedicated /live endpoint before the multiplex refactor — fast
+// enough to feel real-time, slow enough that the browser doesn't
+// drown in JSON parsing during heavy text deltas.
+const THROTTLE_MS = 150
+
+export class LiveRegistry extends EventEmitter {
+  private sessions = new Map<string, LiveSession>()
+  private throttleTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private lastEmitted = new Map<string, number>()
+
+  constructor() {
+    super()
+    // Many subscribers can listen at once (one per /api/events
+    // connection — i.e. one per browser tab).
+    this.setMaxListeners(0)
+  }
+
+  create(interactionId: string, sessionId: string): LiveSession {
     // `create` is idempotent only insofar as the caller wouldn't reuse
     // an interactionId — they're freshly minted UUIDs in proxy.ts so we
     // assume no collisions and overwrite if one ever exists.
-    const s = new LiveSession()
-    this.sessions.set(interactionId, s)
-    return s
+    const session = new LiveSession(sessionId)
+    this.sessions.set(interactionId, session)
+
+    session.emitter.on('update', () => this.scheduleEmit(interactionId))
+    session.emitter.on('done', () => this.handleDone(interactionId))
+
+    return session
   }
 
   get(interactionId: string): LiveSession | undefined {
@@ -88,6 +130,52 @@ export class LiveRegistry {
   }
 
   remove(interactionId: string) {
+    const t = this.throttleTimers.get(interactionId)
+    if (t) {
+      clearTimeout(t)
+      this.throttleTimers.delete(interactionId)
+    }
+    this.lastEmitted.delete(interactionId)
     this.sessions.delete(interactionId)
+  }
+
+  private scheduleEmit(iid: string) {
+    if (this.throttleTimers.has(iid)) return
+    const now = Date.now()
+    const last = this.lastEmitted.get(iid) ?? 0
+    const wait = Math.max(0, THROTTLE_MS - (now - last))
+    const timer = setTimeout(() => {
+      this.throttleTimers.delete(iid)
+      this.lastEmitted.set(iid, Date.now())
+      this.emitUpdate(iid)
+    }, wait)
+    this.throttleTimers.set(iid, timer)
+  }
+
+  private handleDone(iid: string) {
+    // Flush any pending throttled update so the terminal snapshot
+    // always reaches subscribers before the `done` event.
+    const t = this.throttleTimers.get(iid)
+    if (t) {
+      clearTimeout(t)
+      this.throttleTimers.delete(iid)
+    }
+    this.lastEmitted.set(iid, Date.now())
+    this.emitUpdate(iid)
+    const live = this.sessions.get(iid)
+    if (!live) return
+    const ev: LiveDoneEvent = { iid, sid: live.sessionId }
+    this.emit('live-done', ev)
+  }
+
+  private emitUpdate(iid: string) {
+    const live = this.sessions.get(iid)
+    if (!live) return
+    const ev: LiveUpdateEvent = {
+      iid,
+      sid: live.sessionId,
+      snapshot: live.snapshot(),
+    }
+    this.emit('live-update', ev)
   }
 }

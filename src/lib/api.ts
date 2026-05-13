@@ -106,63 +106,129 @@ export const api = {
     ),
 }
 
-// Convenience for SSE event subscription.
-export function subscribeEvents(cb: (e: { kind: string; sessionId: string; id: string }) => void) {
-  const es = new EventSource('/api/events')
-  es.addEventListener('capture', (ev) => {
-    try {
-      cb(JSON.parse((ev as MessageEvent).data))
-    } catch {}
-  })
-  return () => es.close()
-}
-
 // Snapshot of an in-flight interaction. Mirrors the server-side
-// LiveSnapshot shape; sent on every throttled tick over the
-// /api/sessions/:sid/interactions/:iid/live SSE endpoint.
+// LiveSnapshot shape; arrives via `live-update` events on the shared
+// /api/events channel.
 export interface LiveSnapshot {
   response?: AnthropicResponse
   done: boolean
   error?: { message: string; status?: number }
 }
 
-// Tail snapshots for an in-flight interaction. The server emits one
-// `snapshot` per ~150ms while the stream is live, plus a terminal
-// `done` event when it ends — at which point the caller should drop
-// the subscription and refetch the persisted record. The cleanup
-// function returned here is safe to call multiple times.
+// ── Shared /api/events multiplexer ──────────────────────────────────────
+//
+// Every browser tab used to open one EventSource per `subscribeEvents`
+// caller AND one per open in-flight InteractionCard (the `/live`
+// endpoint). With three components each calling `subscribeEvents` and
+// any non-trivial session having several streaming iters, a single tab
+// would hold 6+ SSE connections at once — pinning Chrome's HTTP/1.1
+// per-origin cap and queueing normal fetches behind them.
+//
+// The server now multiplexes capture + live-snapshot + live-done over
+// `/api/events`. We mirror that here: ONE EventSource per tab, lazily
+// created on first subscription. Component-level `subscribeEvents` /
+// `subscribeLive` calls register filtering listeners on top.
+
+export interface CaptureEvent {
+  kind: 'session' | 'message' | 'interaction'
+  sessionId: string
+  id: string
+}
+
+type LiveUpdatePayload = { iid: string; sid: string; snapshot: LiveSnapshot }
+type LiveDonePayload = { iid: string; sid: string }
+
+let sharedSource: EventSource | null = null
+const captureListeners = new Set<(e: CaptureEvent) => void>()
+const liveUpdateListenersByIid = new Map<string, Set<(snap: LiveSnapshot) => void>>()
+const liveDoneListenersByIid = new Map<string, Set<() => void>>()
+
+function ensureSharedSource(): EventSource {
+  if (sharedSource) return sharedSource
+  const es = new EventSource('/api/events')
+  es.addEventListener('capture', (ev) => {
+    try {
+      const payload = JSON.parse((ev as MessageEvent).data) as CaptureEvent
+      for (const cb of captureListeners) {
+        try { cb(payload) } catch {}
+      }
+    } catch {}
+  })
+  es.addEventListener('live-update', (ev) => {
+    try {
+      const payload = JSON.parse((ev as MessageEvent).data) as LiveUpdatePayload
+      const set = liveUpdateListenersByIid.get(payload.iid)
+      if (!set) return
+      for (const cb of set) {
+        try { cb(payload.snapshot) } catch {}
+      }
+    } catch {}
+  })
+  es.addEventListener('live-done', (ev) => {
+    try {
+      const payload = JSON.parse((ev as MessageEvent).data) as LiveDonePayload
+      const set = liveDoneListenersByIid.get(payload.iid)
+      if (!set) return
+      // Snapshot the set first — listeners typically unsubscribe
+      // themselves on `done`, which would otherwise mutate while we're
+      // iterating.
+      for (const cb of Array.from(set)) {
+        try { cb() } catch {}
+      }
+    } catch {}
+  })
+  // EventSource auto-reconnects on transport errors with its own
+  // exponential-ish backoff. We don't tear down on error: a momentary
+  // hiccup would otherwise orphan every component subscription. The
+  // server side is idempotent — we just resume getting events.
+  sharedSource = es
+  return es
+}
+
+// Subscribe to capture (session/message/interaction created) events.
+// Returns an unsubscribe function. Safe to call multiple times.
+export function subscribeEvents(cb: (e: CaptureEvent) => void) {
+  ensureSharedSource()
+  captureListeners.add(cb)
+  return () => {
+    captureListeners.delete(cb)
+  }
+}
+
+// Subscribe to live-snapshot updates for one in-flight interaction.
+// `onSnapshot` may fire many times per second; `onDone` fires once
+// when the upstream stream ends — the caller should then refetch the
+// persisted record for the authoritative final shape. The returned
+// cleanup is idempotent.
 export function subscribeLive(
-  sid: string,
+  _sid: string,
   iid: string,
   onSnapshot: (snap: LiveSnapshot) => void,
   onDone?: () => void,
 ): () => void {
-  const url = `/api/sessions/${encodeURIComponent(sid)}/interactions/${encodeURIComponent(iid)}/live`
-  const es = new EventSource(url)
+  ensureSharedSource()
   let closed = false
-  const close = () => {
-    if (closed) return
-    closed = true
-    try {
-      es.close()
-    } catch {}
-  }
-  es.addEventListener('snapshot', (ev) => {
-    if (closed) return
-    try {
-      onSnapshot(JSON.parse((ev as MessageEvent).data) as LiveSnapshot)
-    } catch {}
-  })
-  es.addEventListener('done', () => {
+
+  const updates = liveUpdateListenersByIid.get(iid) ?? new Set()
+  if (!liveUpdateListenersByIid.has(iid)) liveUpdateListenersByIid.set(iid, updates)
+  updates.add(onSnapshot)
+
+  const doneHandler = () => {
     if (closed) return
     onDone?.()
     close()
-  })
-  // EventSource will reconnect on transport errors by default; we
-  // don't want runaway retries against a stale endpoint, so we close
-  // on the first hard error.
-  es.addEventListener('error', () => {
-    close()
-  })
+  }
+  const dones = liveDoneListenersByIid.get(iid) ?? new Set()
+  if (!liveDoneListenersByIid.has(iid)) liveDoneListenersByIid.set(iid, dones)
+  dones.add(doneHandler)
+
+  const close = () => {
+    if (closed) return
+    closed = true
+    updates.delete(onSnapshot)
+    if (updates.size === 0) liveUpdateListenersByIid.delete(iid)
+    dones.delete(doneHandler)
+    if (dones.size === 0) liveDoneListenersByIid.delete(iid)
+  }
   return close
 }
