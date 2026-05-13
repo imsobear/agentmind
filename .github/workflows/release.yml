@@ -41,11 +41,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck
-        run: pnpm typecheck
-
+      # `pnpm build` runs first because vite + @tanstack/router-plugin
+      # is what writes `src/routeTree.gen.ts`. Without that file the
+      # subsequent typecheck cannot resolve any of the route modules.
       - name: Build
         run: pnpm build
+
+      - name: Typecheck
+        run: pnpm typecheck
 
       - name: Read package metadata
         id: pkg
