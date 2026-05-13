@@ -76,6 +76,33 @@ jobs:
       # second. curl.exe ships on windows-latest and behaves exactly
       # like everywhere else.
 
+      # Diagnostic: confirm the spawned node process is alive and
+      # actually listening on 8189 before we start the readiness
+      # poll. Previous runs printed "ready at..." in cli.log but no
+      # TCP listener ever appeared, suggesting either an early exit
+      # or a binding to the wrong interface.
+      - name: Diagnose listening + process state
+        run: |
+          Start-Sleep -Seconds 3
+          $cliPid = (Get-Content "$env:GITHUB_WORKSPACE\cli.pid").Trim()
+          Write-Host "--- process state ---"
+          try {
+            $p = Get-Process -Id $cliPid -ErrorAction Stop
+            Write-Host ("alive: pid=$cliPid name=$($p.ProcessName) " +
+              "wm=$($p.WorkingSet64) cpu=$($p.CPU)")
+          } catch {
+            Write-Host "::warning::CLI process pid=$cliPid is NOT alive"
+          }
+          Write-Host "--- listening 8189 (any iface) ---"
+          (& netstat.exe -ano) -split "`r?`n" | Where-Object { $_ -match ':8189' }
+          Write-Host "--- cli.log so far ---"
+          Get-Content "$env:GITHUB_WORKSPACE\cli.log"     -ErrorAction SilentlyContinue
+          Write-Host "--- cli.err.log so far ---"
+          Get-Content "$env:GITHUB_WORKSPACE\cli.err.log" -ErrorAction SilentlyContinue
+          Write-Host "--- verbose curl probe ---"
+          & curl.exe -v --max-time 3 http://127.0.0.1:8189/api/sessions 2>&1
+          Write-Host "(curl exit: $LASTEXITCODE)"
+
       - name: Wait for readiness
         run: |
           $start = Get-Date
