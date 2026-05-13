@@ -67,20 +67,28 @@ jobs:
           "$($proc.Id)" | Out-File -FilePath "$env:GITHUB_WORKSPACE\cli.pid" -NoNewline
           Write-Host "CLI pid: $($proc.Id) (log: $logPath)"
 
+      # All probes go through curl.exe rather than Invoke-WebRequest.
+      # PSv7's Invoke-WebRequest on windows-latest does proxy auto-
+      # detection + connection-pooling that intermittently never
+      # actually opens a TCP connection to 127.0.0.1, which made the
+      # readiness probe time out for 60s even though the server log
+      # showed "ready at http://127.0.0.1:8189" within the first
+      # second. curl.exe ships on windows-latest and behaves exactly
+      # like everywhere else.
+
       - name: Wait for readiness
         run: |
           $start = Get-Date
           $deadline = $start.AddSeconds(60)
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 500
-            try {
-              $r = Invoke-WebRequest http://127.0.0.1:8189/api/sessions -UseBasicParsing -TimeoutSec 2
-              if ($r.StatusCode -eq 200) {
-                $elapsed = [int]((Get-Date) - $start).TotalMilliseconds
-                Write-Host "CLI ready after ${elapsed}ms"
-                exit 0
-              }
-            } catch { }
+            $code = (& curl.exe -s -o NUL -w "%{http_code}" --max-time 2 `
+              http://127.0.0.1:8189/api/sessions)
+            if ($code -eq '200') {
+              $elapsed = [int]((Get-Date) - $start).TotalMilliseconds
+              Write-Host "CLI ready after ${elapsed}ms"
+              exit 0
+            }
           }
           Write-Host "::error::CLI never became ready within 60s"
           Get-Content "$env:GITHUB_WORKSPACE\cli.log"     -ErrorAction SilentlyContinue
@@ -89,20 +97,22 @@ jobs:
 
       - name: Probe — root SSR
         run: |
-          $r = Invoke-WebRequest http://127.0.0.1:8189/ -UseBasicParsing
-          if ($r.StatusCode -ne 200) { Write-Host "::error::GET / => $($r.StatusCode)"; exit 1 }
-          if ($r.Content -notmatch 'AgentMind') {
+          $body = & curl.exe -fsS http://127.0.0.1:8189/
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::GET / failed (curl exit $LASTEXITCODE)"; exit 1 }
+          if ($body -notmatch 'AgentMind') {
             Write-Host "::error::GET / body did not mention AgentMind"
-            Write-Host $r.Content.Substring(0, [Math]::Min(500, $r.Content.Length))
+            Write-Host $body.Substring(0, [Math]::Min(500, $body.Length))
             exit 1
           }
           Write-Host "GET / => 200, body looks right"
 
       - name: Probe — favicon (regressed pre-fix)
         run: |
-          $r = Invoke-WebRequest http://127.0.0.1:8189/favicon.svg -UseBasicParsing
-          if ($r.StatusCode -ne 200) { Write-Host "::error::GET /favicon.svg => $($r.StatusCode)"; exit 1 }
-          $ct = $r.Headers['Content-Type']
+          $code = & curl.exe -s -o NUL -w "%{http_code}" `
+            -H "Accept: image/svg+xml" http://127.0.0.1:8189/favicon.svg
+          $ct   = & curl.exe -sI http://127.0.0.1:8189/favicon.svg `
+            | Select-String -Pattern '^content-type:' | ForEach-Object { $_.Line.Trim() }
+          if ($code -ne '200') { Write-Host "::error::GET /favicon.svg => $code"; exit 1 }
           if ($ct -notmatch 'image/svg') {
             Write-Host "::error::GET /favicon.svg content-type unexpected: $ct"; exit 1
           }
@@ -110,47 +120,42 @@ jobs:
 
       - name: Probe — hashed asset (regressed pre-fix)
         run: |
-          $html = (Invoke-WebRequest http://127.0.0.1:8189/ -UseBasicParsing).Content
+          $html = & curl.exe -fsS http://127.0.0.1:8189/
           if (-not ($html -match '/assets/[A-Za-z0-9._-]+\.js')) {
             Write-Host "::error::no /assets/*.js reference in HTML — vite build layout changed?"
             exit 1
           }
           $asset = $Matches[0]
           Write-Host "asset path: $asset"
-          $r = Invoke-WebRequest "http://127.0.0.1:8189$asset" -UseBasicParsing
-          if ($r.StatusCode -ne 200) { Write-Host "::error::GET $asset => $($r.StatusCode)"; exit 1 }
-          if ($r.Headers['Content-Type'] -notmatch 'javascript') {
-            Write-Host "::error::asset content-type unexpected: $($r.Headers['Content-Type'])"
+          $code = & curl.exe -s -o NUL -w "%{http_code}" "http://127.0.0.1:8189$asset"
+          $ct   = & curl.exe -sI "http://127.0.0.1:8189$asset" `
+            | Select-String -Pattern '^content-type:' | ForEach-Object { $_.Line.Trim() }
+          if ($code -ne '200') { Write-Host "::error::GET $asset => $code"; exit 1 }
+          if ($ct -notmatch 'javascript') {
+            Write-Host "::error::asset content-type unexpected: $ct"
             exit 1
           }
           Write-Host "GET $asset => 200"
 
       - name: Probe — capture API
         run: |
-          $r = Invoke-WebRequest http://127.0.0.1:8189/api/sessions -UseBasicParsing
-          if ($r.StatusCode -ne 200) { Write-Host "::error::GET /api/sessions => $($r.StatusCode)"; exit 1 }
-          # On a clean runner sessions dir is empty — body should parse as [].
-          $body = $r.Content | ConvertFrom-Json
-          if ($null -eq $body) { Write-Host "::error::/api/sessions did not return JSON"; exit 1 }
-          Write-Host "GET /api/sessions => 200 ($($body.Count) sessions)"
+          $body = & curl.exe -fsS http://127.0.0.1:8189/api/sessions
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::GET /api/sessions failed"; exit 1 }
+          $sessions = $body | ConvertFrom-Json
+          if ($null -eq $sessions) { Write-Host "::error::/api/sessions did not return JSON"; exit 1 }
+          Write-Host "GET /api/sessions => 200 ($($sessions.Count) sessions)"
 
       - name: Probe — path traversal is blocked
         run: |
-          # `Invoke-WebRequest` 404s throw; treat 404 (or 400) as PASS,
-          # 200 as FAIL.
-          $status = 0
-          try {
-            $r = Invoke-WebRequest "http://127.0.0.1:8189/assets/../../package.json" `
-              -UseBasicParsing
-            $status = $r.StatusCode
-          } catch {
-            $status = [int]$_.Exception.Response.StatusCode
-          }
-          if ($status -eq 200) {
+          # curl --path-as-is so the literal `..` reaches the server
+          # instead of getting client-side normalized.
+          $code = & curl.exe -s -o NUL -w "%{http_code}" --path-as-is `
+            "http://127.0.0.1:8189/assets/../../package.json"
+          if ($code -eq '200') {
             Write-Host "::error::traversal probe returned 200 — path-traversal guard broken"
             exit 1
           }
-          Write-Host "GET /assets/../../package.json => $status (blocked)"
+          Write-Host "GET /assets/../../package.json => $code (blocked)"
 
       - name: Stop CLI
         if: always()
