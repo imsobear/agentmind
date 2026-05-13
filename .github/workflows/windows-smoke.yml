@@ -54,149 +54,108 @@ jobs:
       #   - GET /assets/*.js   hashed asset (same regression)
       #   - GET /api/sessions  capture-API JSON
       #   - GET /../package.json  traversal — must 404
-      - name: Start CLI in background
+      #
+      # IMPORTANT: the GH Actions Windows runner wraps each `run:` step
+      # in a Windows Job Object. When the step ends, every process in
+      # that job is force-terminated. Earlier revisions of this workflow
+      # spawned the CLI in a "Start CLI" step and tried to probe it in
+      # later steps — the CLI was killed the instant the spawning step
+      # ended, so probes always saw "Connection refused" even though
+      # cli.log already had "ready at http://127.0.0.1:8189". Fix: keep
+      # the CLI and every probe inside one big step.
+      - name: Smoke test (boot CLI + probe endpoints)
         run: |
+          $base    = 'http://127.0.0.1:8189'
           $logPath = "$env:GITHUB_WORKSPACE\cli.log"
           $errPath = "$env:GITHUB_WORKSPACE\cli.err.log"
+
           $proc = Start-Process node `
             -ArgumentList 'bin/cli.js','--port','8189','--no-open' `
             -PassThru `
             -NoNewWindow `
             -RedirectStandardOutput $logPath `
             -RedirectStandardError  $errPath
-          "$($proc.Id)" | Out-File -FilePath "$env:GITHUB_WORKSPACE\cli.pid" -NoNewline
           Write-Host "CLI pid: $($proc.Id) (log: $logPath)"
 
-      # All probes go through curl.exe rather than Invoke-WebRequest.
-      # PSv7's Invoke-WebRequest on windows-latest does proxy auto-
-      # detection + connection-pooling that intermittently never
-      # actually opens a TCP connection to 127.0.0.1, which made the
-      # readiness probe time out for 60s even though the server log
-      # showed "ready at http://127.0.0.1:8189" within the first
-      # second. curl.exe ships on windows-latest and behaves exactly
-      # like everywhere else.
+          # curl.exe for every probe — PSv7 Invoke-WebRequest on
+          # windows-latest sometimes never opens a TCP connection to
+          # 127.0.0.1.
+          function Fail([string]$msg) {
+            Write-Host "::error::$msg"
+            Write-Host '--- cli.log ---'
+            Get-Content $logPath -ErrorAction SilentlyContinue
+            Write-Host '--- cli.err.log ---'
+            Get-Content $errPath -ErrorAction SilentlyContinue
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
+            exit 1
+          }
 
-      # Diagnostic: confirm the spawned node process is alive and
-      # actually listening on 8189 before we start the readiness
-      # poll. Previous runs printed "ready at..." in cli.log but no
-      # TCP listener ever appeared, suggesting either an early exit
-      # or a binding to the wrong interface.
-      - name: Diagnose listening + process state
-        run: |
-          Start-Sleep -Seconds 3
-          $cliPid = (Get-Content "$env:GITHUB_WORKSPACE\cli.pid").Trim()
-          Write-Host "--- process state ---"
           try {
-            $p = Get-Process -Id $cliPid -ErrorAction Stop
-            Write-Host ("alive: pid=$cliPid name=$($p.ProcessName) " +
-              "wm=$($p.WorkingSet64) cpu=$($p.CPU)")
-          } catch {
-            Write-Host "::warning::CLI process pid=$cliPid is NOT alive"
-          }
-          Write-Host "--- listening 8189 (any iface) ---"
-          (& netstat.exe -ano) -split "`r?`n" | Where-Object { $_ -match ':8189' }
-          Write-Host "--- cli.log so far ---"
-          Get-Content "$env:GITHUB_WORKSPACE\cli.log"     -ErrorAction SilentlyContinue
-          Write-Host "--- cli.err.log so far ---"
-          Get-Content "$env:GITHUB_WORKSPACE\cli.err.log" -ErrorAction SilentlyContinue
-          Write-Host "--- verbose curl probe ---"
-          & curl.exe -v --max-time 3 http://127.0.0.1:8189/api/sessions 2>&1
-          Write-Host "(curl exit: $LASTEXITCODE)"
-
-      - name: Wait for readiness
-        run: |
-          $start = Get-Date
-          $deadline = $start.AddSeconds(60)
-          while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 500
-            $code = (& curl.exe -s -o NUL -w "%{http_code}" --max-time 2 `
-              http://127.0.0.1:8189/api/sessions)
-            if ($code -eq '200') {
-              $elapsed = [int]((Get-Date) - $start).TotalMilliseconds
-              Write-Host "CLI ready after ${elapsed}ms"
-              exit 0
+            # 1. wait for readiness (max 60s)
+            $start    = Get-Date
+            $deadline = $start.AddSeconds(60)
+            $ready    = $false
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Milliseconds 500
+              if ($proc.HasExited) {
+                Fail "CLI process exited early (exit=$($proc.ExitCode)) before becoming ready"
+              }
+              $code = (& curl.exe -s -o NUL -w "%{http_code}" --max-time 2 "$base/api/sessions")
+              if ($code -eq '200') {
+                $elapsed = [int]((Get-Date) - $start).TotalMilliseconds
+                Write-Host "CLI ready after ${elapsed}ms"
+                $ready = $true
+                break
+              }
             }
-          }
-          Write-Host "::error::CLI never became ready within 60s"
-          Get-Content "$env:GITHUB_WORKSPACE\cli.log"     -ErrorAction SilentlyContinue
-          Get-Content "$env:GITHUB_WORKSPACE\cli.err.log" -ErrorAction SilentlyContinue
-          exit 1
+            if (-not $ready) { Fail "CLI never became ready within 60s" }
 
-      - name: Probe — root SSR
-        run: |
-          $body = & curl.exe -fsS http://127.0.0.1:8189/
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::GET / failed (curl exit $LASTEXITCODE)"; exit 1 }
-          if ($body -notmatch 'AgentMind') {
-            Write-Host "::error::GET / body did not mention AgentMind"
-            Write-Host $body.Substring(0, [Math]::Min(500, $body.Length))
-            exit 1
-          }
-          Write-Host "GET / => 200, body looks right"
+            # 2. GET /  — SSR HTML mentions the product name
+            $body = & curl.exe -fsS "$base/"
+            if ($LASTEXITCODE -ne 0) { Fail "GET / failed (curl exit $LASTEXITCODE)" }
+            if ($body -notmatch 'AgentMind') {
+              Write-Host $body.Substring(0, [Math]::Min(500, $body.Length))
+              Fail "GET / body did not mention AgentMind"
+            }
+            Write-Host "GET / => 200, body looks right"
 
-      - name: Probe — favicon (regressed pre-fix)
-        run: |
-          $code = & curl.exe -s -o NUL -w "%{http_code}" `
-            -H "Accept: image/svg+xml" http://127.0.0.1:8189/favicon.svg
-          $ct   = & curl.exe -sI http://127.0.0.1:8189/favicon.svg `
-            | Select-String -Pattern '^content-type:' | ForEach-Object { $_.Line.Trim() }
-          if ($code -ne '200') { Write-Host "::error::GET /favicon.svg => $code"; exit 1 }
-          if ($ct -notmatch 'image/svg') {
-            Write-Host "::error::GET /favicon.svg content-type unexpected: $ct"; exit 1
-          }
-          Write-Host "GET /favicon.svg => 200 ($ct)"
+            # 3. GET /favicon.svg — static asset (regressed pre-0.1.6)
+            $code = & curl.exe -s -o NUL -w "%{http_code}" "$base/favicon.svg"
+            $ct   = (& curl.exe -sI "$base/favicon.svg" `
+              | Select-String -Pattern '^content-type:').Line.Trim()
+            if ($code -ne '200')         { Fail "GET /favicon.svg => $code" }
+            if ($ct -notmatch 'image/svg') { Fail "GET /favicon.svg content-type unexpected: $ct" }
+            Write-Host "GET /favicon.svg => 200 ($ct)"
 
-      - name: Probe — hashed asset (regressed pre-fix)
-        run: |
-          $html = & curl.exe -fsS http://127.0.0.1:8189/
-          if (-not ($html -match '/assets/[A-Za-z0-9._-]+\.js')) {
-            Write-Host "::error::no /assets/*.js reference in HTML — vite build layout changed?"
-            exit 1
-          }
-          $asset = $Matches[0]
-          Write-Host "asset path: $asset"
-          $code = & curl.exe -s -o NUL -w "%{http_code}" "http://127.0.0.1:8189$asset"
-          $ct   = & curl.exe -sI "http://127.0.0.1:8189$asset" `
-            | Select-String -Pattern '^content-type:' | ForEach-Object { $_.Line.Trim() }
-          if ($code -ne '200') { Write-Host "::error::GET $asset => $code"; exit 1 }
-          if ($ct -notmatch 'javascript') {
-            Write-Host "::error::asset content-type unexpected: $ct"
-            exit 1
-          }
-          Write-Host "GET $asset => 200"
+            # 4. GET /assets/*.js — hashed asset (regressed pre-0.1.6)
+            if (-not ($body -match '/assets/[A-Za-z0-9._-]+\.js')) {
+              Fail "no /assets/*.js reference in HTML — vite build layout changed?"
+            }
+            $asset = $Matches[0]
+            Write-Host "asset path: $asset"
+            $code = & curl.exe -s -o NUL -w "%{http_code}" "$base$asset"
+            $ct   = (& curl.exe -sI "$base$asset" `
+              | Select-String -Pattern '^content-type:').Line.Trim()
+            if ($code -ne '200')      { Fail "GET $asset => $code" }
+            if ($ct -notmatch 'javascript') { Fail "asset content-type unexpected: $ct" }
+            Write-Host "GET $asset => 200"
 
-      - name: Probe — capture API
-        run: |
-          $body = & curl.exe -fsS http://127.0.0.1:8189/api/sessions
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::GET /api/sessions failed"; exit 1 }
-          $sessions = $body | ConvertFrom-Json
-          if ($null -eq $sessions) { Write-Host "::error::/api/sessions did not return JSON"; exit 1 }
-          Write-Host "GET /api/sessions => 200 ($($sessions.Count) sessions)"
+            # 5. GET /api/sessions — capture-API JSON
+            $body = & curl.exe -fsS "$base/api/sessions"
+            if ($LASTEXITCODE -ne 0) { Fail "GET /api/sessions failed" }
+            $sessions = $body | ConvertFrom-Json
+            if ($null -eq $sessions) { Fail "/api/sessions did not return JSON" }
+            Write-Host "GET /api/sessions => 200 ($($sessions.Count) sessions)"
 
-      - name: Probe — path traversal is blocked
-        run: |
-          # curl --path-as-is so the literal `..` reaches the server
-          # instead of getting client-side normalized.
-          $code = & curl.exe -s -o NUL -w "%{http_code}" --path-as-is `
-            "http://127.0.0.1:8189/assets/../../package.json"
-          if ($code -eq '200') {
-            Write-Host "::error::traversal probe returned 200 — path-traversal guard broken"
-            exit 1
+            # 6. GET /assets/../../package.json — path-traversal MUST be blocked.
+            # --path-as-is keeps the literal `..` so the server gets to make the
+            # decision.
+            $code = & curl.exe -s -o NUL -w "%{http_code}" --path-as-is `
+              "$base/assets/../../package.json"
+            if ($code -eq '200') { Fail "traversal probe returned 200 — path-traversal guard broken" }
+            Write-Host "GET /assets/../../package.json => $code (blocked)"
+
+            Write-Host "✅ Windows smoke passed"
+          } finally {
+            try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
           }
-          Write-Host "GET /assets/../../package.json => $code (blocked)"
-
-      - name: Stop CLI
-        if: always()
-        run: |
-          $pidPath = "$env:GITHUB_WORKSPACE\cli.pid"
-          if (Test-Path $pidPath) {
-            $cliPid = Get-Content $pidPath
-            try { Stop-Process -Id $cliPid -Force -ErrorAction SilentlyContinue } catch { }
-          }
-
-      - name: Dump logs on failure
-        if: failure()
-        run: |
-          Write-Host "--- cli.log ---"
-          Get-Content "$env:GITHUB_WORKSPACE\cli.log" -ErrorAction SilentlyContinue
-          Write-Host "--- cli.err.log ---"
-          Get-Content "$env:GITHUB_WORKSPACE\cli.err.log" -ErrorAction SilentlyContinue
