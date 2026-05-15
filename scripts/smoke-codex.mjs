@@ -226,7 +226,7 @@ await new Promise((r) => chatGptStub.listen(CHATGPT_UPSTREAM_PORT, '127.0.0.1', 
 log('chatgpt-route stub listening on', CHATGPT_UPSTREAM_PORT)
 
 // 1b. Plant a legacy mixed-agent project file BEFORE the CLI starts,
-//     so the storage migration runs on it at boot. We use the pre-0.2.2
+//     so the storage migration runs on it at boot. We use the pre-0.2.0
 //     id scheme (sha(cwd) only) which the migration is supposed to
 //     detect and split per-agent.
 //
@@ -848,7 +848,7 @@ if (listShadow.body.some((p) => p.cwd === '\u2026')) {
 log('OK — env_context scoping wins over AGENTS.md literal:')
 log('  shadow project cwd =', shadowProj.cwd)
 
-// 8. (cwd, agent) projectId scoping. Pre-0.2.2 the projectId was just
+// 8. (cwd, agent) projectId scoping. Pre-0.2.0 the projectId was just
 //    sha(cwd), so running both `claude` and `codex` from the same
 //    directory merged their traffic into a single project — with a
 //    single primaryAgent badge that lied about half the messages.
