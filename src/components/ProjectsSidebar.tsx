@@ -87,6 +87,14 @@ function ProjectRow({ p, active }: { p: ProjectListItem; active: boolean }) {
         <span className="font-medium text-foreground truncate">
           {p.cwd ? lastPathSeg(p.cwd) : p.projectId.slice(0, 8)}
         </span>
+        {p.agentType && (
+          // Both agents get a coloured tag so a mixed sidebar is
+          // scannable at a glance. The tag uses the agent's brand tint
+          // (claude=peach for Anthropic's warm palette, codex=lavender
+          // for the OpenAI side), kept low-chroma so it never
+          // out-competes the `live` pulse or an error badge.
+          <AgentBadge agent={p.agentType} />
+        )}
         <span className="text-muted-foreground ml-auto tabular-nums">
           {formatDistanceToNowStrict(time, { addSuffix: false })}
         </span>
@@ -117,6 +125,44 @@ function ProjectRow({ p, active }: { p: ProjectListItem; active: boolean }) {
       )}
     </Link>
   )
+}
+
+function AgentBadge({ agent }: { agent: string }) {
+  const colorVar =
+    agent === 'codex-cli'
+      ? 'var(--agent-codex)'
+      : agent === 'claude-code'
+        ? 'var(--agent-claude)'
+        : undefined
+  return (
+    <span
+      className="text-[9px] uppercase tracking-wider font-mono rounded px-1 py-0 shrink-0 border"
+      style={
+        colorVar
+          ? {
+              color: colorVar,
+              borderColor: `color-mix(in oklab, ${colorVar} 40%, transparent)`,
+              backgroundColor: `color-mix(in oklab, ${colorVar} 10%, transparent)`,
+            }
+          : undefined
+      }
+      title={agentTooltip(agent)}
+    >
+      {agentShortLabel(agent)}
+    </span>
+  )
+}
+
+function agentShortLabel(a: string): string {
+  if (a === 'codex-cli') return 'codex'
+  if (a === 'claude-code') return 'claude'
+  return a
+}
+
+function agentTooltip(a: string): string {
+  if (a === 'codex-cli') return 'Captured via OpenAI Responses API (Codex CLI)'
+  if (a === 'claude-code') return 'Captured via Anthropic Messages API (Claude Code)'
+  return a
 }
 
 function lastPathSeg(p: string): string {

@@ -25,7 +25,34 @@
 //
 // Only the MAIN call's iterations are kept and rendered.
 
-import type { CapturedInteraction, CapturedMessage } from '../lib/anthropic-types'
+import type {
+  AnthropicRequest,
+  AnthropicResponse,
+  CapturedInteraction,
+  CapturedMessage,
+} from '../lib/anthropic-types'
+import type {
+  ResponsesObject,
+  ResponsesRequest,
+  ResponsesOutputItem,
+  ResponsesInputItem,
+  ResponsesFunctionCallItem,
+  ResponsesCustomToolCallItem,
+  ResponsesLocalShellCallItem,
+  ResponsesWebSearchCallItem,
+  ResponsesImageGenerationCallItem,
+  ResponsesToolSearchCallItem,
+  FunctionCallOutputPayload,
+} from '../lib/openai-responses-types'
+import {
+  agentTypeOf,
+  isMainInteractionFor,
+  latestUserTextFromRequest,
+  modelOf,
+  stopReasonOf,
+  transcriptLength,
+  usageOf,
+} from './interaction-view'
 
 export interface InteractionStub {
   interactionId: string
@@ -38,13 +65,17 @@ export interface InteractionStub {
   stopReason: unknown
   usage?: unknown
   hasError: boolean
-  // Count of messages this iteration inherited verbatim from the previous
-  // main-agent iteration's `request.messages`. The first `prevMessageCount`
-  // entries are the cached/inherited prefix; everything from
-  // `prevMessageCount` onwards is what was appended between the two calls
-  // (the assistant's previous output + the tool_result(s) it produced).
-  // 0 for the first iteration of a message — the whole array is "new".
+  // Count of items this iteration inherited verbatim from the previous
+  // main-agent iteration's transcript (Anthropic `messages` / Responses
+  // `input`). The first `prevMessageCount` entries are the cached
+  // prefix; everything from `prevMessageCount` onwards is what was
+  // appended between the two calls (the assistant's previous output +
+  // the tool_result(s) it produced). 0 for the first iteration of a
+  // message — the whole array is "new".
   prevMessageCount: number
+  // Stamp the per-iteration agent type so cards can render the correct
+  // protocol view. Optional for back-compat (pre-0.2 stubs lacked it).
+  agentType?: import('../lib/anthropic-types').AgentType
 }
 
 // One local tool execution, paired by tool_use_id between two iterations.
@@ -92,14 +123,14 @@ export interface AggregatedMessage extends CapturedMessage {
   actionSegments: ActionSegment[]
 }
 
-const MAIN_TOOL_THRESHOLD = 1 // ≥1 tool on the request = main agent
-
 // A request whose `tools` array is non-empty came from the real agent.
-// Anything with zero tools is a Claude Code helper call (haiku topic
-// classifier, post-processing, title generator) — pure framework noise
-// from the user's perspective, dropped at display time.
+// Anything with zero tools is a helper call (Claude Code's haiku topic
+// classifier, post-processing, title generator; Codex CLI's compaction /
+// summariser) — pure framework noise from the user's perspective,
+// dropped at display time. See `interaction-view.isMainInteractionFor`
+// for the protocol-agnostic implementation.
 export function isMainInteraction(it: CapturedInteraction): boolean {
-  return (it.request?.tools?.length ?? 0) >= MAIN_TOOL_THRESHOLD
+  return isMainInteractionFor(it)
 }
 
 export function aggregateMessages(
@@ -144,32 +175,13 @@ export function aggregateMessages(
   return aggregated
 }
 
-// Pull the latest user-typed text from a main interaction's messages array.
-// Falls back to whatever is in the first user message, minus system-reminder
-// wrappers, since claude code interleaves those into the user role.
+// Pull the latest user-typed text from a main interaction's request.
+// Delegates to interaction-view so the per-protocol differences (Anthropic
+// `messages` with <system-reminder> wrappers vs Responses `input` with
+// plain text blocks) live in one place.
 function deriveFirstUserText(mainIts: CapturedInteraction[]): string | undefined {
   if (!mainIts.length) return undefined
-  const msgs = mainIts[0].request?.messages ?? []
-  // Walk in reverse to find the freshest user-typed text.
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i]
-    if (m.role !== 'user') continue
-    let text: string | undefined
-    if (typeof m.content === 'string') text = m.content
-    else {
-      for (const b of m.content) {
-        if (b.type === 'text') {
-          const stripped = b.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-          if (stripped) {
-            text = stripped
-            break
-          }
-        }
-      }
-    }
-    if (text) return text
-  }
-  return undefined
+  return latestUserTextFromRequest(mainIts[0])
 }
 
 function buildAggregated(
@@ -184,12 +196,17 @@ function buildAggregated(
     startedAt: it.startedAt,
     endedAt: it.endedAt,
     durationMs: it.durationMs,
-    model: it.request?.model,
+    model: modelOf(it),
+    // Caller can pass a custom counter (middleware does, for legacy
+    // reasons), but the per-protocol default in interaction-view is
+    // identical, so the parameter is now effectively redundant. Kept
+    // for the signature compat.
     toolCount: countToolUseBlocks(it),
-    stopReason: it.response?.stop_reason ?? null,
-    usage: it.response?.usage,
+    stopReason: stopReasonOf(it) as InteractionStub['stopReason'],
+    usage: usageOf(it),
     hasError: !!it.error,
-    prevMessageCount: idx > 0 ? (its[idx - 1].request?.messages?.length ?? 0) : 0,
+    prevMessageCount: idx > 0 ? transcriptLength(its[idx - 1]) : 0,
+    agentType: agentTypeOf(it),
   }))
   const earliestStart = stubs.length ? stubs[0].startedAt : m.startedAt
   const stopReason = stubs.length ? stubs[stubs.length - 1].stopReason : null
@@ -262,10 +279,17 @@ function flattenResultContent(content: unknown): {
 }
 
 export function computeActionSegments(its: CapturedInteraction[]): ActionSegment[] {
+  // Dispatch on protocol. The two implementations build the same
+  // `ActionSegment[]` shape so the UI doesn't care which agent emitted
+  // the traffic — only the pairing keys & payload extraction differ.
+  if (its.length && agentTypeOf(its[0]) === 'codex-cli') {
+    return computeActionSegmentsResponses(its)
+  }
   const segments: ActionSegment[] = []
   for (let i = 0; i < its.length; i++) {
     const cur = its[i]
-    const toolUses = (cur.response?.content ?? []).filter(
+    const curResp = cur.response as AnthropicResponse | undefined
+    const toolUses = (curResp?.content ?? []).filter(
       (b) => b.type === 'tool_use',
     ) as Array<{ type: 'tool_use'; id: string; name: string; input: unknown }>
     if (toolUses.length === 0) continue
@@ -287,7 +311,8 @@ export function computeActionSegments(its: CapturedInteraction[]): ActionSegment
       continue
     }
 
-    const msgs = next.request?.messages ?? []
+    const nextReq = next.request as AnthropicRequest | undefined
+    const msgs = nextReq?.messages ?? []
     let toolResults: Array<{
       tool_use_id: string
       content: unknown
@@ -297,7 +322,7 @@ export function computeActionSegments(its: CapturedInteraction[]): ActionSegment
       const m = msgs[j]
       if (m.role !== 'user' || typeof m.content === 'string') continue
       const trs = m.content.filter(
-        (b) => (b as { type?: string }).type === 'tool_result',
+        (b: any) => b.type === 'tool_result',
       ) as Array<{ tool_use_id: string; content: unknown; is_error?: boolean }>
       if (trs.length) {
         toolResults = trs
@@ -345,4 +370,251 @@ export function computeActionSegments(its: CapturedInteraction[]): ActionSegment
     })
   }
   return segments
+}
+
+// ── Action reconstruction · Codex / OpenAI Responses ─────────────────
+//
+// The Anthropic version above pairs `tool_use` (response.content) with
+// `tool_result` (next request.messages[…].user.content) by `tool_use_id`.
+// Codex's Responses-API equivalent is structurally the same, but the
+// names and locations differ:
+//
+//   producer side  (cur.response.output[])
+//     function_call          { call_id, name, arguments: <json string> }
+//     custom_tool_call       { call_id, name, input: <freeform string> }
+//     local_shell_call       { call_id?, action }
+//     web_search_call        { call_id?, action }
+//     image_generation_call  { call_id?, status, revised_prompt? }
+//     tool_search_call       { call_id?, execution, arguments }
+//
+//   consumer side  (next.request.input[])
+//     function_call_output       { call_id, output: <string|content[]> }
+//     custom_tool_call_output    { call_id, output: <string|content[]> }
+//     mcp_tool_call_output       { call_id, output: <unknown> }
+//
+// Pair by `call_id`. Codex's `shell` tool wraps stdout/stderr in a
+// JSON-stringified envelope `{output, metadata:{exit_code,...}}`; we
+// unwrap it for the preview so the user sees command output rather
+// than the wire-format wrapper.
+
+function computeActionSegmentsResponses(its: CapturedInteraction[]): ActionSegment[] {
+  const segments: ActionSegment[] = []
+  for (let i = 0; i < its.length; i++) {
+    const cur = its[i]
+    const curResp = cur.response as ResponsesObject | undefined
+    const output = curResp?.output ?? []
+    const toolCalls: CodexToolCall[] = []
+    for (const item of output) {
+      const t = extractToolCallFromOutput(item)
+      if (t) toolCalls.push(t)
+    }
+    if (toolCalls.length === 0) continue
+
+    const next = its[i + 1]
+    if (!next) {
+      segments.push({
+        fromInteractionId: cur.interactionId,
+        pending: true,
+        actions: toolCalls.map((t) => ({
+          toolUseId: t.callId,
+          name: t.name,
+          input: t.input,
+          isError: false,
+        })),
+      })
+      continue
+    }
+
+    const nextReq = next.request as ResponsesRequest | undefined
+    const inputs = (nextReq?.input ?? []) as ResponsesInputItem[]
+    const resultByCall = new Map<string, ResolvedOutput>()
+    for (const inp of inputs) {
+      const r = extractToolResultFromInput(inp)
+      if (r) resultByCall.set(r.callId, r)
+    }
+
+    const actions: ActionEntry[] = toolCalls.map((t) => {
+      const r = resultByCall.get(t.callId)
+      if (!r) {
+        return {
+          toolUseId: t.callId,
+          name: t.name,
+          input: t.input,
+          isError: false,
+          unmatched: true,
+        }
+      }
+      const truncated = r.text.length > RESULT_PREVIEW_LIMIT
+      return {
+        toolUseId: t.callId,
+        name: t.name,
+        input: t.input,
+        resultPreview: truncated ? r.text.slice(0, RESULT_PREVIEW_LIMIT) : r.text,
+        resultChars: r.chars,
+        resultTruncated: truncated || undefined,
+        isError: r.isError,
+        hasImage: r.hasImage || undefined,
+      }
+    })
+
+    const endedAtMs = cur.endedAt
+      ? new Date(cur.endedAt).getTime()
+      : new Date(cur.startedAt).getTime() + (cur.durationMs ?? 0)
+    const nextStartedAtMs = new Date(next.startedAt).getTime()
+
+    segments.push({
+      fromInteractionId: cur.interactionId,
+      toInteractionId: next.interactionId,
+      durationMs: Math.max(0, nextStartedAtMs - endedAtMs),
+      actions,
+    })
+  }
+  return segments
+}
+
+interface CodexToolCall {
+  callId: string
+  name: string
+  input: unknown
+}
+
+function extractToolCallFromOutput(item: ResponsesOutputItem): CodexToolCall | null {
+  if (item.type === 'function_call') {
+    const f = item as ResponsesFunctionCallItem
+    // arguments is a raw JSON string; parse opportunistically. If parse
+    // fails (incomplete during a live stream, custom serialiser, …)
+    // surface the raw string — better than dropping the call entirely.
+    let parsed: unknown = f.arguments
+    if (typeof f.arguments === 'string') {
+      try {
+        parsed = JSON.parse(f.arguments)
+      } catch {
+        parsed = f.arguments
+      }
+    }
+    return { callId: f.call_id, name: f.name, input: parsed }
+  }
+  if (item.type === 'custom_tool_call') {
+    const c = item as ResponsesCustomToolCallItem
+    return { callId: c.call_id, name: c.name, input: c.input }
+  }
+  if (item.type === 'local_shell_call') {
+    const l = item as ResponsesLocalShellCallItem
+    const id = l.call_id ?? l.id
+    if (!id) return null
+    return { callId: id, name: 'local_shell', input: l.action }
+  }
+  if (item.type === 'web_search_call') {
+    const w = item as ResponsesWebSearchCallItem
+    const id = (w as { call_id?: string }).call_id ?? w.id
+    if (!id) return null
+    return { callId: id, name: 'web_search', input: w.action ?? null }
+  }
+  if (item.type === 'image_generation_call') {
+    const ig = item as ResponsesImageGenerationCallItem
+    const id = (ig as { call_id?: string }).call_id ?? ig.id
+    if (!id) return null
+    return {
+      callId: id,
+      name: 'image_generation',
+      input: { revised_prompt: ig.revised_prompt, status: ig.status },
+    }
+  }
+  if (item.type === 'tool_search_call') {
+    const ts = item as ResponsesToolSearchCallItem
+    const id = ts.call_id ?? ts.id
+    if (!id) return null
+    return { callId: id, name: 'tool_search', input: ts.arguments }
+  }
+  return null
+}
+
+interface ResolvedOutput {
+  callId: string
+  text: string
+  chars: number
+  isError: boolean
+  hasImage: boolean
+}
+
+function extractToolResultFromInput(item: ResponsesInputItem): ResolvedOutput | null {
+  if (item.type === 'function_call_output') {
+    return resolveOutputPayload(item.call_id, item.output)
+  }
+  if (item.type === 'custom_tool_call_output') {
+    return resolveOutputPayload(item.call_id, item.output)
+  }
+  if (item.type === 'mcp_tool_call_output') {
+    const out = (item as { output: unknown }).output
+    if (typeof out === 'string') return resolveOutputPayload(item.call_id, out)
+    if (Array.isArray(out)) {
+      return resolveOutputPayload(item.call_id, out as FunctionCallOutputPayload)
+    }
+    const str = safeStringify(out)
+    return { callId: item.call_id, text: str, chars: str.length, isError: false, hasImage: false }
+  }
+  return null
+}
+
+function resolveOutputPayload(
+  callId: string,
+  payload: FunctionCallOutputPayload,
+): ResolvedOutput {
+  if (typeof payload === 'string') {
+    // Codex's `shell` tool returns a JSON-stringified envelope:
+    //   { output: "<combined stdout/stderr>",
+    //     metadata: { exit_code, duration_seconds } }
+    // Surface the inner `output` so the preview shows what the user
+    // actually wants to see; flag non-zero exit codes as errors.
+    let text = payload
+    let isError = false
+    if (looksLikeShellEnvelope(payload)) {
+      try {
+        const obj = JSON.parse(payload) as {
+          output?: unknown
+          metadata?: { exit_code?: number }
+        }
+        if (typeof obj.output === 'string') {
+          text = obj.output
+          if (
+            obj.metadata?.exit_code != null &&
+            obj.metadata.exit_code !== 0
+          ) {
+            isError = true
+          }
+        }
+      } catch {
+        // not actually JSON — keep raw text
+      }
+    }
+    return { callId, text, chars: text.length, isError, hasImage: false }
+  }
+  let text = ''
+  let chars = 0
+  let hasImage = false
+  for (const block of payload) {
+    if (block.type === 'input_text') {
+      text += block.text + '\n'
+      chars += block.text.length
+    } else if (block.type === 'input_image') {
+      hasImage = true
+    }
+  }
+  return { callId, text, chars, isError: false, hasImage }
+}
+
+// Cheap probe before JSON.parse — most function_call_output strings are
+// freeform tool output and we'd rather not pay the parse cost just to
+// discover that.
+function looksLikeShellEnvelope(s: string): boolean {
+  const t = s.trimStart()
+  return t.startsWith('{') && t.includes('"output"') && t.includes('"metadata"')
+}
+
+function safeStringify(v: unknown): string {
+  try {
+    return typeof v === 'string' ? v : JSON.stringify(v, null, 2)
+  } catch {
+    return String(v)
+  }
 }

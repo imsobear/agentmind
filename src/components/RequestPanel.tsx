@@ -10,7 +10,13 @@ import {
   Bot,
 } from 'lucide-react'
 import type { InteractionFull } from '#/lib/api'
-import type { MessageParam, ToolDefinition, SystemBlock, ContentBlock } from '#/lib/anthropic-types'
+import type {
+  AnthropicRequest,
+  ContentBlock,
+  MessageParam,
+  SystemBlock,
+  ToolDefinition,
+} from '#/lib/anthropic-types'
 import { Badge } from '#/components/ui/badge'
 import { cn } from '#/lib/utils'
 
@@ -24,8 +30,21 @@ export function RequestPanel({
   // immediately spot what changed between consecutive LLM calls.
   prevMessageCount?: number
 }) {
-  const req = interaction.request
+  // This panel only ever renders for `agentType === 'claude-code'`
+  // (InteractionCard branches before mounting). Cast in one place so
+  // the rest of the component stays strongly typed.
+  const req = interaction.request as AnthropicRequest
   const sysBlocks = normalizeSystem(req.system)
+  // The "user prompt" — what the human actually typed — is the last
+  // user-role message in the transcript that carries meaningful text
+  // (skipping <system-reminder>-only wrappers Claude Code injects and
+  // tool_result-bearing user turns). On iter 1 of a message this index
+  // is essentially "the input to this message" and we want it loud
+  // enough that you don't have to expand a section to see it.
+  const userPromptIdx = useMemo(
+    () => findUserPromptIndex(req.messages),
+    [req.messages],
+  )
   return (
     // All four kinds of "what was sent" — each message, the system
     // prompt, the tool definitions — render as flat sibling sections
@@ -41,10 +60,11 @@ export function RequestPanel({
           m,
           i,
           isNew: i >= prevMessageCount && prevMessageCount > 0,
+          isUserPrompt: i === userPromptIdx,
         }))
         .reverse()
-        .map(({ m, i, isNew }) => (
-          <MessageSection key={i} m={m} isNew={isNew} />
+        .map(({ m, i, isNew, isUserPrompt }) => (
+          <MessageSection key={i} m={m} isNew={isNew} isUserPrompt={isUserPrompt} />
         ))}
       {sysBlocks.length > 0 && <SystemSection blocks={sysBlocks} />}
       {req.tools && req.tools.length > 0 && <ToolsSection tools={req.tools} />}
@@ -52,12 +72,36 @@ export function RequestPanel({
   )
 }
 
+// Index of the user message that holds the human-typed prompt. We walk
+// the transcript from the end backwards and return the first user-role
+// message whose flat text content (after stripping <system-reminder>
+// wrappers) is non-empty. Tool-result user messages have no text →
+// they're skipped, so the search lands on the prior prompt that
+// produced them. Returns -1 if nothing qualifies.
+function findUserPromptIndex(messages: MessageParam[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== 'user') continue
+    const blocks: ContentBlock[] =
+      typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : m.content
+    for (const b of blocks) {
+      if (b.type === 'text') {
+        const cleaned = stripSystemReminder(b.text).trim()
+        if (cleaned) return i
+      }
+    }
+  }
+  return -1
+}
+
 function MessageSection({
   m,
   isNew,
+  isUserPrompt,
 }: {
   m: MessageParam
   isNew: boolean
+  isUserPrompt: boolean
 }) {
   const blocks: ContentBlock[] = typeof m.content === 'string'
     ? [{ type: 'text', text: m.content }]
@@ -69,9 +113,9 @@ function MessageSection({
     <span className="flex items-baseline gap-0.5">
       <span>messages</span>
       {/* Role suffix is intentionally muted so the only loud accent
-          on this row is the `new` badge — that's the signal worth the
-          eye's attention. The User/Bot icon already conveys role at
-          a glance, no need for a saturated colour too. */}
+          on this row is the `new` / `prompt` badge — that's the signal
+          worth the eye's attention. The User/Bot icon already conveys
+          role at a glance, no need for a saturated colour too. */}
       <span
         className={cn(
           'font-mono opacity-50',
@@ -83,6 +127,15 @@ function MessageSection({
     </span>
   )
 
+  // `prompt` and `new` are sibling status pills — same Badge variant,
+  // same slot (summary, which has `normal-case` reset), same right-edge
+  // anchor. We render them after the inline summary so the only thing
+  // ever competing with them is the truncated body preview, which
+  // shrinks as needed.
+  //
+  // They rarely co-exist in practice (the user-typed prompt belongs to
+  // the inherited message prefix from iter 1, so it's never `new`), but
+  // the layout still handles both at once.
   const summary = (
     <>
       {inlineSummary && (
@@ -90,10 +143,25 @@ function MessageSection({
           “{inlineSummary}”
         </span>
       )}
+      {isUserPrompt && (
+        <Badge
+          variant="success"
+          className={cn(
+            '!text-[10px] !py-0 shrink-0',
+            !inlineSummary && 'ml-auto',
+          )}
+          title="The human-typed prompt that produced this turn"
+        >
+          prompt
+        </Badge>
+      )}
       {isNew && (
         <Badge
           variant="success"
-          className="ml-auto !text-[10px] !py-0 shrink-0"
+          className={cn(
+            '!text-[10px] !py-0 shrink-0',
+            !inlineSummary && !isUserPrompt && 'ml-auto',
+          )}
           title="Appended to messages[] between this iter and the previous one"
         >
           new
@@ -103,14 +171,25 @@ function MessageSection({
   )
 
   return (
-    <Section
-      title={title}
-      icon={isUser ? <User className="w-3.5 h-3.5" /> : <Bot className="w-3.5 h-3.5" />}
-      summary={summary}
-      defaultOpen={false}
+    <div
+      className={cn(
+        // Left rail accent + faint bg tint marks the user prompt
+        // without adding a separate row of chrome. We use the same
+        // green-ish `--user` accent the role label already uses so the
+        // signal is consistent.
+        isUserPrompt &&
+          'rounded-md border-l-2 border-[color:var(--user)]/60 bg-[color:var(--user)]/[0.04] pl-2 -ml-2 py-1',
+      )}
     >
-      <NumberedBlocks blocks={blocks} />
-    </Section>
+      <Section
+        title={title}
+        icon={isUser ? <User className="w-3.5 h-3.5" /> : <Bot className="w-3.5 h-3.5" />}
+        summary={summary}
+        defaultOpen={isUserPrompt}
+      >
+        <NumberedBlocks blocks={blocks} />
+      </Section>
+    </div>
   )
 }
 

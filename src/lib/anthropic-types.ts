@@ -141,6 +141,15 @@ export type ContentDelta =
 // records in memory so the rest of the codebase only ever sees the new
 // shape.
 
+// Which upstream protocol an interaction speaks. Determines how the
+// renderer should interpret request/response shapes. A project carries the
+// `primaryAgent` (whichever agent first wrote to it / dominates by call
+// count) but individual interactions stamp their own protocol so a
+// mixed-agent project still renders correctly.
+//
+// Stays as a closed string union; new agents should be added explicitly.
+export type AgentType = 'claude-code' | 'codex-cli' | 'unknown'
+
 export interface CapturedProject {
   type: 'project'
   projectId: string
@@ -148,6 +157,11 @@ export interface CapturedProject {
   firstSeenModel?: string
   cwd?: string // extracted from system prompt of the first request
   proxyVersion: string
+  // The agent we believe is the primary user of this project. Lazy: we
+  // stamp it on first sight and don't try to move it once interactions
+  // accumulate. Listing/sidebar use this; per-interaction `agentType`
+  // overrides locally for cards.
+  primaryAgent?: AgentType
 }
 
 export interface CapturedMessage {
@@ -159,6 +173,13 @@ export interface CapturedMessage {
   firstUserText?: string // for sidebar preview
 }
 
+// Polymorphic over the two wire protocols we currently capture. The
+// `agentType` tag is a wide closed union of strings we control, NOT the
+// upstream-claimed protocol — so a single agent's traffic stays consistent
+// even if the model changes.
+//
+// Older records (pre-multi-agent) lack `agentType`; readers must treat
+// missing as `'claude-code'` for back-compat (it was the only protocol then).
 export interface CapturedInteraction {
   type: 'interaction'
   interactionId: string
@@ -168,14 +189,25 @@ export interface CapturedInteraction {
   startedAt: string
   endedAt?: string
   durationMs?: number
-  request: AnthropicRequest
+  // Tag for the request/response union. Pre-0.2 records omit this; readers
+  // should default to 'claude-code' when absent.
+  agentType?: AgentType
+  // We intentionally widen this to `unknown` and let the renderer narrow on
+  // `agentType`. Two reasons:
+  //   1. Avoids loading both protocol type modules into every consumer.
+  //   2. JSONL on disk is the canonical shape — TS types track it loosely,
+  //      we don't pretend to validate at boundaries.
+  request: AnthropicRequest | unknown
   requestHeaders: Record<string, string>
   responseHeaders?: Record<string, string>
   // Full assembled response after SSE has been replayed.
   // Undefined while the request is still in flight, or if it errored.
-  response?: AnthropicResponse
+  response?: AnthropicResponse | unknown
   // Raw SSE events in order, for the timeline view & debugging.
-  sseEvents?: SseEvent[]
+  // Anthropic events use this type; OpenAI Responses events are widened
+  // through here as `unknown[]` and re-narrowed by the renderer based on
+  // `agentType`.
+  sseEvents?: SseEvent[] | unknown[]
   // Set when proxy upstream failed.
   error?: { message: string; status?: number }
 }

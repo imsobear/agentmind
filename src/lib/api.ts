@@ -2,6 +2,7 @@
 // src/server/middleware.ts. Keep them additive — the server is authoritative.
 
 import type {
+  AgentType,
   AnthropicRequest,
   AnthropicResponse,
   CapturedInteraction,
@@ -17,6 +18,9 @@ export interface ProjectListItem {
   startedAt?: string
   cwd?: string
   model?: string
+  // Which agent owns this project. Pre-0.2 records lack this field —
+  // treat missing as `'claude-code'` for back-compat.
+  agentType?: AgentType
   mtime: number
   sizeBytes: number
   messageCount: number
@@ -34,13 +38,19 @@ export interface InteractionStub {
   durationMs?: number
   model?: string
   toolCount: number
-  stopReason: StopReason
+  // The Responses API can produce status strings outside Anthropic's
+  // closed `stop_reason` union (e.g. "failed", "cancelled"). Widen to
+  // string here — UI narrows back to the Anthropic palette when it can.
+  stopReason: StopReason | string | null
   usage?: Usage
   hasError: boolean
-  // Messages this iter inherited verbatim from the previous main-agent
-  // iter — request.messages[0 .. prevMessageCount-1] are the cached prefix,
-  // request.messages[prevMessageCount ..] is what was appended in the gap.
+  // Items this iter inherited verbatim from the previous main-agent
+  // iter — request transcript[0 .. prevMessageCount-1] is the cached
+  // prefix, transcript[prevMessageCount ..] is what was appended in
+  // the gap. "Transcript" = Anthropic's `messages` / Responses' `input`.
   prevMessageCount: number
+  // Per-iter agent type. Optional for back-compat; missing = claude-code.
+  agentType?: AgentType
 }
 
 // One local tool execution that happened between two API calls. Pairs an
@@ -82,10 +92,13 @@ export interface ProjectDetail {
   messages: MessageWithInteractions[]
 }
 
+// `request`/`response`/`sseEvents` are polymorphic over `agentType`.
+// We keep them widened on this client type and let renderers narrow.
+// Pre-0.2 records (no `agentType`) are by definition Anthropic-shaped.
 export type InteractionFull = CapturedInteraction & {
-  request: AnthropicRequest
-  response?: AnthropicResponse
-  sseEvents?: SseEvent[]
+  request: AnthropicRequest | unknown
+  response?: AnthropicResponse | unknown
+  sseEvents?: SseEvent[] | unknown[]
 }
 
 async function getJson<T>(path: string): Promise<T> {
@@ -108,9 +121,9 @@ export const api = {
 
 // Snapshot of an in-flight interaction. Mirrors the server-side
 // LiveSnapshot shape; arrives via `live-update` events on the shared
-// /api/events channel.
+// /api/events channel. Polymorphic over `agentType` — UI narrows.
 export interface LiveSnapshot {
-  response?: AnthropicResponse
+  response?: AnthropicResponse | unknown
   done: boolean
   error?: { message: string; status?: number }
 }

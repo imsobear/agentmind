@@ -23,13 +23,13 @@
 // fetches.
 
 import { EventEmitter } from 'node:events'
-import { SseAccumulator } from './sse'
-import type { AnthropicResponse } from '../lib/anthropic-types'
+import type { SseAccumulatorLike } from './adapters'
 
 export interface LiveSnapshot {
-  // The AnthropicResponse-shaped object assembled so far by the
-  // SseAccumulator. Undefined until `message_start` arrives.
-  response?: AnthropicResponse
+  // Protocol-specific response shape assembled so far. Undefined until
+  // the first informative event (Anthropic's `message_start`, Responses'
+  // `response.created`). UI narrows on `interaction.agentType`.
+  response?: unknown
   // True once the upstream stream completed (cleanly or via error) and
   // no further updates will arrive. After this fires once, the client
   // should drop the live subscription and refetch the persisted
@@ -39,7 +39,7 @@ export interface LiveSnapshot {
 }
 
 export class LiveSession {
-  readonly accumulator: SseAccumulator
+  readonly accumulator: SseAccumulatorLike
   readonly emitter: EventEmitter
   done = false
   error?: { message: string; status?: number }
@@ -48,9 +48,9 @@ export class LiveSession {
   // to keep a separate iid → projectId map.
   readonly projectId: string
 
-  constructor(projectId: string) {
+  constructor(projectId: string, accumulator: SseAccumulatorLike) {
     this.projectId = projectId
-    this.accumulator = new SseAccumulator()
+    this.accumulator = accumulator
     this.emitter = new EventEmitter()
     // Multiple browser tabs may subscribe to the same in-flight
     // interaction; lift the default listener cap so we don't trigger
@@ -112,11 +112,11 @@ export class LiveRegistry extends EventEmitter {
     this.setMaxListeners(0)
   }
 
-  create(interactionId: string, projectId: string): LiveSession {
+  create(interactionId: string, projectId: string, accumulator: SseAccumulatorLike): LiveSession {
     // `create` is idempotent only insofar as the caller wouldn't reuse
     // an interactionId — they're freshly minted UUIDs in proxy.ts so we
     // assume no collisions and overwrite if one ever exists.
-    const session = new LiveSession(projectId)
+    const session = new LiveSession(projectId, accumulator)
     this.sessions.set(interactionId, session)
 
     session.emitter.on('update', () => this.scheduleEmit(interactionId))

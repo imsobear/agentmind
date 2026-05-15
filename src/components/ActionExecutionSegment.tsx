@@ -300,6 +300,26 @@ function oneLinerForInput(name: string, input: unknown): string {
       if (Array.isArray(todos)) return `${todos.length} todo${todos.length === 1 ? '' : 's'}`
       return compactJson(o)
     }
+    // Codex CLI's canonical shell tool — input is `{command: string[],
+    // workdir?, timeout_ms?}`. Show the command as a single line.
+    case 'shell':
+    case 'local_shell': {
+      const cmd = o.command ?? (o as { action?: { command?: unknown } }).action?.command
+      if (Array.isArray(cmd)) return cmd.map(String).join(' ')
+      if (typeof cmd === 'string') return cmd
+      return compactJson(o)
+    }
+    // Codex's `apply_patch` tool — input is a string (the patch body).
+    // Show the first changed file path if we can spot it.
+    case 'apply_patch': {
+      const input = pick('input') ?? pick('patch')
+      if (input) {
+        const m = input.match(/\*\*\*\s+(?:Add|Update|Delete)\s+File:\s+(.+)/i)
+        if (m) return m[1].trim()
+        return input.split('\n')[0]
+      }
+      return compactJson(o)
+    }
     default:
       return compactJson(o)
   }

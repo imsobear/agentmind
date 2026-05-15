@@ -42,3 +42,10 @@ jobs:
 
       - name: Typecheck
         run: pnpm typecheck
+
+      # End-to-end smoke against a stub upstream — catches grouping /
+      # adapter / SSE-parser regressions that typecheck alone misses
+      # (e.g. silently picking up the wrong cwd, or losing the agent
+      # tag during JSONL persistence).
+      - name: Smoke (Codex + Anthropic capture)
+        run: pnpm smoke

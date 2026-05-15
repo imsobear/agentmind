@@ -33,8 +33,8 @@
 //   from their own short message arrays that don't extend any existing
 //   message → each opens a fresh message too.
 
-import type { AnthropicRequest, MessageParam } from '../lib/anthropic-types'
-import { projectIdForCwd } from './projectId'
+import type { AgentType, MessageParam } from '../lib/anthropic-types'
+import { projectIdFor } from './projectId'
 
 interface Message {
   messageId: string
@@ -55,6 +55,11 @@ interface Project {
   // Always present after the first such request — undefined only for
   // brand-new in-process state before any cwd has been seen.
   cwd: string
+  // Every project is single-agent: the projectId hash includes the
+  // agentType, so two agents in the same cwd produce two distinct
+  // projects. This field is the agent that ALL interactions in this
+  // project share.
+  primaryAgent: AgentType
   messages: Message[]
 }
 
@@ -70,6 +75,7 @@ export interface GroupResolution {
   // The cwd we ultimately attributed the request to. Useful for the
   // proxy when it writes the `project` header record on first sight.
   cwd: string
+  primaryAgent: AgentType
 }
 
 function isUserPromptMessage(m: MessageParam): boolean {
@@ -153,11 +159,13 @@ function isPrefixOf(prev: MessageParam[], next: MessageParam[]): boolean {
 
 // Snapshot of an existing project on disk, supplied by the Storage
 // layer at Grouper cold-miss time so message indices keep increasing
-// across proxy restarts (the projectId is now deterministic from cwd,
-// so two runs in the same directory all append to the same file —
-// without rehydration the second run's "iter 1" would re-use index 0).
+// across proxy restarts (the projectId is now deterministic from
+// (cwd, agentType), so two runs of the same agent in the same
+// directory all append to the same file — without rehydration the
+// second run's "iter 1" would re-use index 0).
 export interface ProjectHydration {
   cwd: string
+  primaryAgent: AgentType
   messages: Array<{
     messageId: string
     index: number
@@ -168,61 +176,84 @@ export interface ProjectHydration {
 }
 
 export interface GrouperDeps {
-  // Called on first sight of a cwd in this process. Return any messages
-  // already persisted for that cwd so subsequent indices continue from
-  // there. Returning `undefined` (project not on disk) opens a fresh
-  // project starting at message index 0.
-  hydrate?: (cwd: string) => ProjectHydration | undefined
+  // Called on first sight of a (cwd, agent) pair in this process.
+  // Return any messages already persisted for that combination so
+  // subsequent indices continue from there. Returning `undefined`
+  // (project not on disk) opens a fresh project starting at message
+  // index 0.
+  hydrate?: (cwd: string, agent: AgentType) => ProjectHydration | undefined
+}
+
+// Internal map key: `${cwd}\0${agent}`. The null byte is illegal in
+// real paths so it can't collide with a literal cwd string. Don't use
+// this as a stable identifier — projectId is the user-facing one.
+function projectKey(cwd: string, agent: AgentType): string {
+  return `${cwd}\u0000${agent}`
 }
 
 export class Grouper {
-  // Keyed by cwd. Resolution is O(1) — no scan, no time window.
+  // Keyed by `${cwd}\0${agent}` — one project per (cwd, agent) pair.
+  // Two different agents running in the same cwd produce two
+  // independent projects with two independent message chains. The
+  // hash-style projectId is recomputed deterministically; this map
+  // exists for O(1) in-process lookup, not for persistence.
   private projects = new Map<string, Project>()
-  // Last cwd we routed a request to. Helper calls without their own cwd
-  // (haiku title-gen etc.) attach to this. Empty before the first
-  // cwd-bearing request — those rare leading helpers go to a synthetic
-  // "_orphan_" project to avoid dropping them on the floor.
-  private lastCwd: string | undefined
+  // Last (cwd, agent) pair we routed a real cwd-bearing request to —
+  // remembered per-agent so a Codex helper call that doesn't carry a
+  // cwd doesn't accidentally land in a recent Claude project (and
+  // vice-versa). Empty before the first such request — leading
+  // helpers go to a synthetic "_orphan_" project to avoid dropping
+  // them on the floor.
+  private lastCwdByAgent = new Map<AgentType, string>()
   private readonly deps: GrouperDeps
 
   constructor(deps: GrouperDeps = {}) {
     this.deps = deps
   }
 
-  resolve(
-    req: AnthropicRequest,
-    now: number,
-    newId: () => string,
-    cwd: string | undefined,
-  ): GroupResolution {
-    const resolvedCwd = cwd ?? this.lastCwd ?? '_orphan_'
+  // Protocol-agnostic resolve. The proxy normalises whatever the adapter
+  // saw (Anthropic `messages` array or Codex `input[]` flattened) into
+  // MessageParam[] and hands it here; we don't care which protocol
+  // produced it — prefix-equality reads the same on either.
+  resolve(args: {
+    messages: MessageParam[]
+    now: number
+    newId: () => string
+    cwd: string | undefined
+    agentType: AgentType
+  }): GroupResolution {
+    const { messages, now, newId, cwd, agentType } = args
+    const resolvedCwd = cwd ?? this.lastCwdByAgent.get(agentType) ?? '_orphan_'
 
-    let project = this.projects.get(resolvedCwd)
+    const key = projectKey(resolvedCwd, agentType)
+    let project = this.projects.get(key)
     let isNewProject = false
     if (!project) {
-      // Cold miss in this process — but the cwd's project file may
-      // already exist on disk from previous runs. Pull the persisted
-      // message chain so we extend it rather than starting fresh.
-      const hydration = this.deps.hydrate?.(resolvedCwd)
+      // Cold miss in this process — but the (cwd, agent)'s project
+      // file may already exist on disk from previous runs. Pull the
+      // persisted message chain so we extend it rather than starting
+      // fresh.
+      const hydration = this.deps.hydrate?.(resolvedCwd, agentType)
       project = {
-        projectId: projectIdForCwd(resolvedCwd),
+        projectId: projectIdFor(resolvedCwd, agentType),
         startedAt: now,
         cwd: resolvedCwd,
+        primaryAgent: agentType,
         messages: hydration?.messages.map((m) => ({ ...m })) ?? [],
       }
-      this.projects.set(resolvedCwd, project)
+      this.projects.set(key, project)
       // Only mark as new when there's nothing on disk yet — that's the
       // signal proxy.ts uses to write the `project` header record.
       isNewProject = !hydration
     }
-    if (cwd) this.lastCwd = cwd
+    if (cwd) this.lastCwdByAgent.set(agentType, cwd)
 
     // ── pick / open message inside project
-    const reqUserPrompts = countUserPrompts(req.messages)
+    const reqUserPrompts = countUserPrompts(messages)
     let message: Message | undefined
     for (const m of project.messages) {
       if (m.userPromptCount !== reqUserPrompts) continue
-      if (isPrefixOf(m.lastMessages, req.messages)) {
+      if (isPrefixOf(m.lastMessages, messages)) {
         message = m
         break
       }
@@ -232,7 +263,7 @@ export class Grouper {
       message = {
         messageId: newId(),
         index: project.messages.length,
-        lastMessages: req.messages,
+        lastMessages: messages,
         userPromptCount: reqUserPrompts,
         interactionCount: 0,
       }
@@ -240,7 +271,7 @@ export class Grouper {
       isNewMessage = true
     } else {
       // extension: update lastMessages
-      message.lastMessages = req.messages
+      message.lastMessages = messages
     }
 
     const interactionIndex = message.interactionCount
@@ -249,9 +280,9 @@ export class Grouper {
     // first-user-text preview for newly opened message
     let preview: string | undefined
     if (isNewMessage) {
-      for (let i = req.messages.length - 1; i >= 0; i--) {
-        if (isUserPromptMessage(req.messages[i])) {
-          preview = firstUserText(req.messages[i])
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (isUserPromptMessage(messages[i])) {
+          preview = firstUserText(messages[i])
           break
         }
       }
@@ -265,8 +296,9 @@ export class Grouper {
       isNewMessage,
       interactionIndex,
       firstUserText: preview,
-      isFirstCall: req.messages.length === 1 && req.messages[0]?.role === 'user',
+      isFirstCall: messages.length === 1 && messages[0]?.role === 'user',
       cwd: resolvedCwd,
+      primaryAgent: project.primaryAgent,
     }
   }
 
@@ -274,6 +306,7 @@ export class Grouper {
     return Array.from(this.projects.values()).map((p) => ({
       projectId: p.projectId,
       cwd: p.cwd,
+      primaryAgent: p.primaryAgent,
       messageCount: p.messages.length,
     }))
   }

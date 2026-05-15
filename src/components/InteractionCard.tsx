@@ -34,7 +34,10 @@ import { cn } from '#/lib/utils'
 import { format } from 'date-fns'
 import { RequestPanel } from '#/components/RequestPanel'
 import { ResponsePanel } from '#/components/ResponsePanel'
+import { ResponsesRequestPanel } from '#/components/ResponsesRequestPanel'
+import { ResponsesResponsePanel } from '#/components/ResponsesResponsePanel'
 import { formatDuration } from '#/components/MessageDetail'
+import type { AgentType } from '#/lib/anthropic-types'
 
 export function InteractionCard({
   projectId,
@@ -141,6 +144,11 @@ export function InteractionCard({
 
   const sseEvents = full?.sseEvents ?? []
   const iterLabel = `iter ${index + 1}/${total}`
+  // Per-iter agent dispatch. Falls back to 'claude-code' for pre-0.2
+  // records which lack the field. Determines which protocol-specific
+  // panel pair we render below.
+  const agentType: AgentType = stub.agentType ?? full?.agentType ?? 'claude-code'
+  const isCodex = agentType === 'codex-cli'
 
   return (
     <Card className="overflow-hidden">
@@ -169,10 +177,14 @@ export function InteractionCard({
         <Badge
           variant="info"
           className="!text-[10px] !py-0 gap-1 shrink-0"
-          title="Remote LLM call · request forwarded to api.anthropic.com, response streamed back through this proxy"
+          title={
+            isCodex
+              ? 'Remote LLM call · request forwarded to api.openai.com (Responses API), response streamed back through this proxy'
+              : 'Remote LLM call · request forwarded to api.anthropic.com (Messages API), response streamed back through this proxy'
+          }
         >
           <Cloud className="w-2.5 h-2.5" />
-          remote
+          {isCodex ? 'codex' : 'claude'}
         </Badge>
         <span
           className="text-xs text-muted-foreground font-mono min-w-0 flex-1 truncate"
@@ -252,12 +264,18 @@ export function InteractionCard({
             />
             {error && <div className="p-4 text-xs text-destructive">{error}</div>}
             {!error && !overlayedFull && <div className="p-4 text-xs text-muted-foreground">Loading…</div>}
-            {overlayedFull && (
-              <RequestPanel
-                interaction={overlayedFull}
-                prevMessageCount={stub.prevMessageCount ?? 0}
-              />
-            )}
+            {overlayedFull &&
+              (isCodex ? (
+                <ResponsesRequestPanel
+                  interaction={overlayedFull}
+                  prevMessageCount={stub.prevMessageCount ?? 0}
+                />
+              ) : (
+                <RequestPanel
+                  interaction={overlayedFull}
+                  prevMessageCount={stub.prevMessageCount ?? 0}
+                />
+              ))}
           </section>
           <section className="min-w-0">
             <PanelHeader
@@ -281,7 +299,12 @@ export function InteractionCard({
                 )
               }
             />
-            {overlayedFull && <ResponsePanel interaction={overlayedFull} />}
+            {overlayedFull &&
+              (isCodex ? (
+                <ResponsesResponsePanel interaction={overlayedFull} />
+              ) : (
+                <ResponsePanel interaction={overlayedFull} />
+              ))}
             {!overlayedFull && !error && (
               <div className="p-4 text-xs text-muted-foreground">Loading…</div>
             )}
@@ -400,11 +423,14 @@ function RawJsonButton({ obj, title }: { obj: unknown; title: string }) {
  * captured during the response stream. One line per event with type
  * and a short human-readable summary.
  */
+// Accepts both Anthropic SSE events (typed) and OpenAI Responses events
+// (we widen to unknown for those — summariseEvent's switch falls through
+// to default, which is fine for the timeline-of-event-types view).
 function SseTimelineButton({
   events,
   title,
 }: {
-  events: SseEvent[]
+  events: SseEvent[] | unknown[]
   title: string
 }) {
   return (
@@ -431,17 +457,22 @@ function SseTimelineButton({
         </DialogHeader>
         <DialogBody>
           <div className="flex flex-col gap-0.5 font-mono text-[11px]">
-            {events.map((e, i) => (
-              <div key={i} className="flex items-start gap-2 py-0.5">
-                <span className="tabular-nums text-muted-foreground w-8 shrink-0 text-right">
-                  {i}
-                </span>
-                <span className="text-[color:var(--llm)] shrink-0">{e.type}</span>
-                <span className="text-muted-foreground/80 truncate">
-                  {summarizeEvent(e)}
-                </span>
-              </div>
-            ))}
+            {events.map((e, i) => {
+              const evAny = e as { type?: string }
+              return (
+                <div key={i} className="flex items-start gap-2 py-0.5">
+                  <span className="tabular-nums text-muted-foreground w-8 shrink-0 text-right">
+                    {i}
+                  </span>
+                  <span className="text-[color:var(--llm)] shrink-0">
+                    {evAny.type ?? '(no type)'}
+                  </span>
+                  <span className="text-muted-foreground/80 truncate">
+                    {summarizeEvent(e as SseEvent)}
+                  </span>
+                </div>
+              )
+            })}
           </div>
         </DialogBody>
       </DialogContent>
@@ -449,7 +480,11 @@ function SseTimelineButton({
   )
 }
 
-function summarizeEvent(e: SseEvent): string {
+function summarizeEvent(ev: SseEvent | { type?: string }): string {
+  // Narrowed locally — caller passes either typed Anthropic events or
+  // unknown-shaped Responses-API events. Only the Anthropic ones have
+  // a meaningful summary; everything else falls through to "".
+  const e = ev as SseEvent
   switch (e.type) {
     case 'message_start':
       return `id=${e.message.id} model=${e.message.model}`

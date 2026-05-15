@@ -61,35 +61,12 @@ export function MessagesPane() {
   // immediately visible without scrolling. The per-row `#index` badge
   // still reflects the original (oldest-first) chronological order.
   const visibleMessages = [...detail.messages].reverse()
-  // The header used to lead with "SESSION <uuid>" — but the user never
-  // refers to projects by their internal id, they identify them by
-  // working directory, which is also what we now key projects on. So
-  // the title row shows cwd (or a neutral fallback) and message count
-  // only; the projectId stays in the URL for navigation but never
-  // leaks into the chrome.
+  // No column header — cwd and message count both already appear on
+  // the project row in the sidebar, so a second copy here was a static
+  // chrome row that didn't earn its 60px. The messages list just
+  // starts at the top of the column.
   return (
     <>
-      {/* The min-h here mirrors the sidebar Header so both columns line
-          up to the same baseline regardless of typography. Once height
-          is structural we can size the cwd line independently. */}
-      {/* The cwd row is the column's "title", but it must not outshout
-          the product wordmark in the left column. We use the same
-          muted-foreground colour as supporting metadata; mono font is
-          kept because cwd is a path, but the lower contrast brings the
-          visual weight back below "AgentMind". */}
-      <div className="px-4 border-b border-border min-h-[60px] flex flex-col justify-center">
-        <div
-          className="font-mono text-xs text-muted-foreground truncate"
-          title={detail.project?.cwd ?? 'cwd unknown'}
-        >
-          {detail.project?.cwd ?? (
-            <span className="italic">cwd unknown</span>
-          )}
-        </div>
-        <div className="text-[10px] text-muted-foreground/70 mt-0.5 tabular-nums">
-          {visibleMessages.length} message{visibleMessages.length === 1 ? '' : 's'}
-        </div>
-      </div>
       <ScrollArea className="flex-1">
         <div className="p-2 flex flex-col gap-1">
           {visibleMessages.map((m) => (

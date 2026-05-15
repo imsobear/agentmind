@@ -1,10 +1,12 @@
 import { AlertCircle } from 'lucide-react'
 import type { InteractionFull } from '#/lib/api'
-import type { ContentBlock } from '#/lib/anthropic-types'
+import type { AnthropicResponse, ContentBlock } from '#/lib/anthropic-types'
 import { ContentBlockView } from '#/components/RequestPanel'
 
 export function ResponsePanel({ interaction }: { interaction: InteractionFull }) {
-  const resp = interaction.response
+  // Only mounted by InteractionCard for `agentType === 'claude-code'`.
+  // Narrow here so the rest of the component is strongly-typed.
+  const resp = interaction.response as AnthropicResponse | undefined
   if (interaction.error) {
     return (
       <div className="p-3 text-xs">
