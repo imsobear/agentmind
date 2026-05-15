@@ -87,17 +87,13 @@ function ProjectRow({ p, active }: { p: ProjectListItem; active: boolean }) {
         <span className="font-medium text-foreground truncate">
           {p.cwd ? lastPathSeg(p.cwd) : p.projectId.slice(0, 8)}
         </span>
-        {p.agentType && p.agentType !== 'claude-code' && (
-          // Show a tiny tag for non-default agents so a mixed sidebar
-          // (claude code in one cwd, codex cli in another) is scannable.
-          // Default Anthropic projects stay un-badged to avoid visual
-          // noise for the dominant case.
-          <span
-            className="text-[9px] uppercase tracking-wider font-mono text-muted-foreground bg-muted/60 rounded px-1 py-0 shrink-0"
-            title={agentTooltip(p.agentType)}
-          >
-            {agentShortLabel(p.agentType)}
-          </span>
+        {p.agentType && (
+          // Both agents get a coloured tag so a mixed sidebar is
+          // scannable at a glance. The tag uses the agent's brand tint
+          // (claude=peach for Anthropic's warm palette, codex=lavender
+          // for the OpenAI side), kept low-chroma so it never
+          // out-competes the `live` pulse or an error badge.
+          <AgentBadge agent={p.agentType} />
         )}
         <span className="text-muted-foreground ml-auto tabular-nums">
           {formatDistanceToNowStrict(time, { addSuffix: false })}
@@ -128,6 +124,32 @@ function ProjectRow({ p, active }: { p: ProjectListItem; active: boolean }) {
         </div>
       )}
     </Link>
+  )
+}
+
+function AgentBadge({ agent }: { agent: string }) {
+  const colorVar =
+    agent === 'codex-cli'
+      ? 'var(--agent-codex)'
+      : agent === 'claude-code'
+        ? 'var(--agent-claude)'
+        : undefined
+  return (
+    <span
+      className="text-[9px] uppercase tracking-wider font-mono rounded px-1 py-0 shrink-0 border"
+      style={
+        colorVar
+          ? {
+              color: colorVar,
+              borderColor: `color-mix(in oklab, ${colorVar} 40%, transparent)`,
+              backgroundColor: `color-mix(in oklab, ${colorVar} 10%, transparent)`,
+            }
+          : undefined
+      }
+      title={agentTooltip(agent)}
+    >
+      {agentShortLabel(agent)}
+    </span>
   )
 }
 

@@ -6,8 +6,17 @@
 // sections under one column — so the user can read both protocols with
 // the same eye movements.
 
-import { useMemo } from 'react'
-import { FileCode2, Wrench, User, Bot, Settings2, FileSearch } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import {
+  FileCode2,
+  Wrench,
+  User,
+  Bot,
+  Settings2,
+  FileSearch,
+  ChevronDown,
+  ChevronRight,
+} from 'lucide-react'
 import type { InteractionFull } from '#/lib/api'
 import type {
   ResponsesRequest,
@@ -33,6 +42,11 @@ export function ResponsesRequestPanel({
   const req = interaction.request as ResponsesRequest
   const items = req.input ?? []
   const tools = req.tools ?? []
+  // Mirrors RequestPanel: spot the user-typed prompt so the eye can
+  // anchor on it without expanding every section. The same backwards
+  // walk used by `interaction-view.latestUserTextFromRequest`, just
+  // returning the index instead of the text.
+  const userPromptIdx = useMemo(() => findUserPromptIndex(items), [items])
   return (
     <div className="p-3 flex flex-col gap-2 text-xs">
       {items
@@ -43,10 +57,16 @@ export function ResponsesRequestPanel({
           // here is `input.length` of the prior iter (server-computed in
           // interaction-view.transcriptLength).
           isNew: i >= prevMessageCount && prevMessageCount > 0,
+          isUserPrompt: i === userPromptIdx,
         }))
         .reverse()
-        .map(({ item, i, isNew }) => (
-          <InputItemSection key={i} item={item} isNew={isNew} />
+        .map(({ item, i, isNew, isUserPrompt }) => (
+          <InputItemSection
+            key={i}
+            item={item}
+            isNew={isNew}
+            isUserPrompt={isUserPrompt}
+          />
         ))}
       {req.instructions && <InstructionsSection text={req.instructions} />}
       {tools.length > 0 && <ToolsSection tools={tools} />}
@@ -54,35 +74,80 @@ export function ResponsesRequestPanel({
   )
 }
 
-function InputItemSection({ item, isNew }: { item: ResponsesInputItem; isNew: boolean }) {
+function findUserPromptIndex(items: ResponsesInputItem[]): number {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i]
+    if (it.type !== 'message' || it.role !== 'user') continue
+    for (const c of it.content ?? []) {
+      if (c.type === 'input_text' && (c as { text: string }).text.trim()) return i
+    }
+  }
+  return -1
+}
+
+function InputItemSection({
+  item,
+  isNew,
+  isUserPrompt,
+}: {
+  item: ResponsesInputItem
+  isNew: boolean
+  isUserPrompt: boolean
+}) {
   const inlineSummary = useMemo(() => summariseItem(item), [item])
   const { icon, title, accent } = headerForItem(item)
   return (
-    <Section
-      title={title}
-      icon={icon}
-      summary={
-        <>
-          {inlineSummary && (
-            <span className="italic text-foreground/70 truncate flex-1 min-w-0">
-              "{inlineSummary}"
-            </span>
-          )}
-          {isNew && (
-            <Badge
-              variant="success"
-              className="ml-auto !text-[10px] !py-0 shrink-0"
-              title="Appended to input[] between this iter and the previous one"
-            >
-              new
-            </Badge>
-          )}
-        </>
-      }
-      defaultOpen={false}
+    <div
+      className={cn(
+        isUserPrompt &&
+          'rounded-md border-l-2 border-[color:var(--user)]/60 bg-[color:var(--user)]/[0.04] pl-2 -ml-2 py-1',
+      )}
     >
-      <InputItemBody item={item} accent={accent} />
-    </Section>
+      <Section
+        title={title}
+        icon={icon}
+        summary={
+          // `prompt` and `new` are sibling status pills — same variant,
+          // same slot. The summary wrapper resets text-transform to
+          // normal-case so both render lowercase regardless of the
+          // section header's uppercase styling.
+          <>
+            {inlineSummary && (
+              <span className="italic text-foreground/70 truncate flex-1 min-w-0">
+                "{inlineSummary}"
+              </span>
+            )}
+            {isUserPrompt && (
+              <Badge
+                variant="success"
+                className={cn(
+                  '!text-[10px] !py-0 shrink-0',
+                  !inlineSummary && 'ml-auto',
+                )}
+                title="The human-typed prompt that produced this turn"
+              >
+                prompt
+              </Badge>
+            )}
+            {isNew && (
+              <Badge
+                variant="success"
+                className={cn(
+                  '!text-[10px] !py-0 shrink-0',
+                  !inlineSummary && !isUserPrompt && 'ml-auto',
+                )}
+                title="Appended to input[] between this iter and the previous one"
+              >
+                new
+              </Badge>
+            )}
+          </>
+        }
+        defaultOpen={isUserPrompt}
+      >
+        <InputItemBody item={item} accent={accent} />
+      </Section>
+    </div>
   )
 }
 
@@ -274,31 +339,72 @@ function ToolsSection({ tools }: { tools: unknown[] }) {
       defaultOpen={false}
     >
       <div className="flex flex-col gap-1">
-        {tools.map((t: any, i) => {
-          // Codex tool entries are loosely-typed (any shape OpenAI accepts).
-          // Common case: `{type: "function", function: {name, description, parameters}}`
-          // but we also see `{type: "custom", name, …}` and similar.
-          const name =
-            t?.function?.name ??
-            t?.name ??
-            (typeof t?.type === 'string' ? `(${t.type})` : `(tool ${i + 1})`)
-          const description = t?.function?.description ?? t?.description
-          return (
-            <div key={i} className="rounded border border-border/60 bg-background/40 px-2 py-1.5">
-              <div className="flex items-center gap-2 text-xs">
-                <FileSearch className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
-                <span className="font-mono text-[color:var(--tool)] truncate">{name}</span>
-                {description && (
-                  <span className="text-muted-foreground text-[11px] line-clamp-1 ml-1">
-                    {description}
-                  </span>
-                )}
-              </div>
-            </div>
-          )
-        })}
+        {tools.map((t, i) => (
+          <ToolRow key={i} tool={t} index={i} />
+        ))}
       </div>
     </Section>
+  )
+}
+
+function ToolRow({ tool, index }: { tool: unknown; index: number }) {
+  const [open, setOpen] = useState(false)
+  // Codex tool entries are loosely-typed (any shape OpenAI accepts).
+  // Three shapes seen in the wild:
+  //   { type: "function", name, description, parameters }   ← Codex 0.x
+  //   { type: "function", function: { name, description, parameters } } ← OpenAI legacy
+  //   { type: "custom", name, format: {...}, description }  ← Codex custom_tool
+  const t = tool as Record<string, unknown>
+  const f = (t?.function ?? {}) as Record<string, unknown>
+  const name =
+    (f.name as string | undefined) ??
+    (t?.name as string | undefined) ??
+    (typeof t?.type === 'string' ? `(${t.type as string})` : `(tool ${index + 1})`)
+  const description =
+    (f.description as string | undefined) ?? (t?.description as string | undefined)
+  // Pull parameters / input schema from whichever nesting the upstream
+  // chose. Falls back to the whole tool object so a yet-unknown shape
+  // still renders something inspectable.
+  const schema =
+    (f.parameters as unknown) ??
+    (t?.parameters as unknown) ??
+    (t?.input_schema as unknown) ??
+    (t?.format as unknown) ??
+    tool
+  return (
+    <div className="rounded border border-border/60 bg-background/40">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-2 px-2 py-1.5 text-left hover:bg-muted/30"
+      >
+        <span className="text-muted-foreground shrink-0">
+          {open ? (
+            <ChevronDown className="w-3.5 h-3.5" />
+          ) : (
+            <ChevronRight className="w-3.5 h-3.5" />
+          )}
+        </span>
+        <FileSearch className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+        <span className="font-mono text-[color:var(--tool)] text-xs shrink-0">{name}</span>
+        {description && !open && (
+          <span className="text-muted-foreground text-[11px] line-clamp-1 ml-1 min-w-0">
+            {description}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="px-3 py-2 border-t border-border/40">
+          {description && (
+            <div className="text-[11px] text-muted-foreground mb-2 whitespace-pre-wrap">
+              {description}
+            </div>
+          )}
+          <pre className="text-[11px] font-mono whitespace-pre-wrap break-words max-h-96 overflow-auto bg-background/60 rounded p-2 border border-border/40">
+            {JSON.stringify(schema, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
   )
 }
 

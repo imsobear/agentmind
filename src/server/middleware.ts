@@ -35,10 +35,11 @@ import type { AgentType, CapturedInteraction, MessageParam } from '../lib/anthro
 // Singletons — middleware lives for the lifetime of the dev server.
 const storage = new Storage()
 const grouper = new Grouper({
-  // Lazy-hydrate from disk on first sight of a cwd so message indices
-  // keep increasing across proxy restarts. Without this hook, restarting
-  // mid-project would start indices from 0 and confuse the UI.
-  hydrate: (cwd) => hydrateProject(cwd),
+  // Lazy-hydrate from disk on first sight of a (cwd, agent) pair so
+  // message indices keep increasing across proxy restarts. Without
+  // this hook, restarting mid-project would start indices from 0 and
+  // confuse the UI.
+  hydrate: (cwd, agent) => hydrateProject(cwd, agent),
 })
 const liveRegistry = new LiveRegistry()
 const events = new EventEmitter()
@@ -64,9 +65,9 @@ for (const adapter of adapters) {
 // extend it without resetting indices. The Storage doesn't know about
 // adapters, so the per-protocol "normalise messages for grouping" step
 // lives here.
-function hydrateProject(cwd: string) {
-  const { projectIdForCwd } = require('./projectId') as typeof import('./projectId')
-  const projectId = projectIdForCwd(cwd)
+function hydrateProject(cwd: string, agent: AgentType) {
+  const { projectIdFor } = require('./projectId') as typeof import('./projectId')
+  const projectId = projectIdFor(cwd, agent)
   const { project, messages, interactions } = storage.loadProject(projectId)
   if (!messages.length && !interactions.length) return undefined
   const byMessage = new Map<string, CapturedInteraction[]>()
@@ -98,7 +99,10 @@ function hydrateProject(cwd: string) {
       interactionCount: its.length,
     }
   })
-  const primaryAgent: AgentType = project?.primaryAgent ?? 'claude-code'
+  // Disk header is authoritative once the file exists; we still pass
+  // `agent` as fallback for the (extremely rare) case where an old
+  // project.jsonl was written without a primaryAgent field.
+  const primaryAgent: AgentType = project?.primaryAgent ?? agent
   return { cwd, primaryAgent, messages: out }
 }
 
@@ -113,29 +117,24 @@ function notFound(res: ServerResponse) {
   sendJson(res, 404, { error: 'not_found' })
 }
 
-// Sentinel cwd values that mark a "shapeless" project — captured because
-// the proxy saw traffic but couldn't anchor it to a real workspace.
-// These accumulate from:
-//   - Pre-0.1.7 records (literal "_orphan_" / "no-cwd" rendered as the cwd)
-//   - Codex requests that redact the cwd to "…" (Unicode horizontal ellipsis,
-//     U+2026) in its <environment_context> block
-//   - Unknown-agent traffic we couldn't classify
-// We hide them from the sidebar; the underlying JSONL stays on disk and
-// /api/projects/:id still serves them so a deep link keeps working.
-const SENTINEL_CWDS = new Set(['_orphan_', 'no-cwd', '\u2026', 'unknown'])
-
 function isInterestingProject(p: {
   cwd?: string
   messageCount: number
 }): boolean {
-  // Projects without a single main-agent interaction are framework noise
-  // (Claude Code haiku helpers, Codex compaction summarisers, abandoned
-  // subagent workdirs). They're never the answer to "what did the agent
-  // do for me today" — hide them.
-  if (p.messageCount === 0) return false
-  if (!p.cwd) return false
-  if (SENTINEL_CWDS.has(p.cwd)) return false
-  return true
+  // Single rule: projects without a single main-agent interaction
+  // are framework noise (Claude Code haiku title-gens, Codex compaction
+  // summarisers, abandoned subagent workdirs that only saw probe
+  // traffic, framework-internal Claude prompts like
+  // "[SUGGESTION MODE: …]" filtered by `isMainInteractionFor`). They're
+  // never the answer to "what did the agent do for me today" — hide.
+  //
+  // We deliberately DO NOT filter on sentinel cwd values ("_orphan_",
+  // "…", undefined): a project can have a missing/garbled cwd from
+  // imperfect extraction but still contain real, substantive traffic
+  // the user wants to inspect. Earlier versions of this filter
+  // suppressed exactly that case and got a "where did my Codex go"
+  // bug report on the first day.
+  return p.messageCount > 0
 }
 
 // Build the API list response: a flat array of project summaries.
@@ -219,24 +218,42 @@ function listProjects(options: { showAll?: boolean } = {}) {
   return summaries.filter(isInterestingProject)
 }
 
-// Best-effort cwd resolution for a stored project. The very first
-// request that opens a project sometimes lacks a cwd in its system
-// prompt (typical for Claude Code's haiku title-gen helpers), so the
-// persisted `project.cwd` can be undefined even though later
-// interactions in the same project clearly carry one. Falling back to
-// a per-protocol scan keeps every UI surface (list / detail) showing
-// the same value.
+// Sentinels emitted by older proxy versions or by buggy cwd
+// extraction (cf. the AGENTS.md-shadowing-regex bug fixed in
+// `ResponsesAdapter.extractCwd`). When we see one of these persisted
+// on disk, treat it as "unknown" and re-derive from the actual
+// interaction stream.
+const CWD_RESOLVE_SENTINELS = new Set([
+  '_orphan_',
+  'no-cwd',
+  '\u2026', // U+2026 horizontal ellipsis — Codex's redacted placeholder
+  'unknown',
+  '',
+])
+
+// Best-effort cwd resolution for a stored project.
+//   1. Trust the persisted `project.cwd` when it's not a sentinel —
+//      it was extracted by the proxy that created the file and is
+//      the cheapest source of truth.
+//   2. Otherwise scan the captured interactions via the per-protocol
+//      adapter, which contains the up-to-date extraction logic. This
+//      is what un-stalls a project whose original cwd was misread
+//      (e.g. landed on the `…` placeholder because an earlier proxy
+//      build had a buggy regex). The on-disk record stays as-is —
+//      we just surface a better value at read time so the UI is
+//      not stuck rendering the bad one.
 function resolveProjectCwd(
   project: { cwd?: string } | undefined,
   interactions: CapturedInteraction[],
 ): string | undefined {
-  if (project?.cwd) return project.cwd
+  const persisted = project?.cwd
+  if (persisted && !CWD_RESOLVE_SENTINELS.has(persisted)) return persisted
   for (const it of interactions) {
     const adapter = adapters.find((a) => a.agentType === agentTypeOf(it))
     const cwd = adapter?.extractCwd(it.request)
-    if (cwd) return cwd
+    if (cwd && !CWD_RESOLVE_SENTINELS.has(cwd)) return cwd
   }
-  return undefined
+  return persisted
 }
 
 function getProjectDetail(projectId: string) {

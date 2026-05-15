@@ -225,6 +225,55 @@ const chatGptStub = http.createServer((req, res) => {
 await new Promise((r) => chatGptStub.listen(CHATGPT_UPSTREAM_PORT, '127.0.0.1', r))
 log('chatgpt-route stub listening on', CHATGPT_UPSTREAM_PORT)
 
+// 1b. Plant a legacy mixed-agent project file BEFORE the CLI starts,
+//     so the storage migration runs on it at boot. We use the pre-0.2.2
+//     id scheme (sha(cwd) only) which the migration is supposed to
+//     detect and split per-agent.
+//
+// We compute the legacy id by running the same hash the OLD code used,
+// inline — that way this test stays standalone and doesn't depend on
+// the runtime still exporting the legacy helper.
+{
+  const { createHash } = await import('node:crypto')
+  const { writeFileSync, mkdirSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const projectsDir = join(dataDir, 'projects')
+  mkdirSync(projectsDir, { recursive: true })
+  const LEGACY_CWD = '/private/var/agentmind-legacy-smoke/mixed'
+  const legacyId = createHash('sha256').update(LEGACY_CWD).digest('hex').slice(0, 16)
+  const lines = [
+    JSON.stringify({
+      type: 'project', projectId: legacyId, cwd: LEGACY_CWD,
+      startedAt: '2025-01-01T00:00:00.000Z', primaryAgent: 'claude-code',
+    }),
+    JSON.stringify({
+      type: 'message', projectId: legacyId, messageId: 'msg-cc', index: 0,
+      startedAt: '2025-01-01T00:00:01.000Z', firstUserText: 'claude side',
+    }),
+    JSON.stringify({
+      type: 'interaction', projectId: legacyId, messageId: 'msg-cc',
+      interactionId: 'it-cc', index: 0, agentType: 'claude-code',
+      startedAt: '2025-01-01T00:00:01.500Z',
+      request: { model: 'claude-3-5', messages: [{ role: 'user', content: 'hi' }] },
+    }),
+    JSON.stringify({
+      type: 'message', projectId: legacyId, messageId: 'msg-cx', index: 1,
+      startedAt: '2025-01-01T00:01:00.000Z', firstUserText: 'codex side',
+    }),
+    JSON.stringify({
+      type: 'interaction', projectId: legacyId, messageId: 'msg-cx',
+      interactionId: 'it-cx', index: 0, agentType: 'codex-cli',
+      startedAt: '2025-01-01T00:01:00.500Z',
+      request: { model: 'gpt-5-codex', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] },
+    }),
+    '',
+  ]
+  writeFileSync(join(projectsDir, `${legacyId}.jsonl`), lines.join('\n'))
+  log('planted legacy mixed-agent file', `${legacyId}.jsonl`, 'cwd=', LEGACY_CWD)
+  // Stash for the post-boot assertion below.
+  globalThis.__legacy = { legacyId, cwd: LEGACY_CWD }
+}
+
 // 2. Boot agentmind-cli pointed at BOTH stubs.
 const cli = spawn(process.execPath, [resolve(repo, 'bin', 'cli.js'),
   '--port', String(PROXY_PORT),
@@ -250,6 +299,31 @@ cli.stderr.on('data', (d) => process.stderr.write('[cli stderr] ' + d.toString()
 
 for (let i = 0; i < 50 && !cliReady; i++) await delay(100)
 if (!cliReady) throw new Error('CLI never reported ready')
+
+// Migration smoke: the legacy mixed-agent file planted above MUST have
+// been split into one (cwd, agent) file per agent at Storage boot.
+{
+  const { readdirSync, existsSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const projectsDir = join(dataDir, 'projects')
+  const { legacyId, cwd } = globalThis.__legacy
+  if (existsSync(join(projectsDir, `${legacyId}.jsonl`))) {
+    throw new Error('legacy file was not removed after migration: ' + legacyId)
+  }
+  const { createHash } = await import('node:crypto')
+  const newCcId = createHash('sha256').update(cwd).update('\0').update('claude-code').digest('hex').slice(0, 16)
+  const newCxId = createHash('sha256').update(cwd).update('\0').update('codex-cli').digest('hex').slice(0, 16)
+  const names = new Set(readdirSync(projectsDir))
+  if (!names.has(`${newCcId}.jsonl`)) {
+    throw new Error('migration did not produce claude file ' + newCcId)
+  }
+  if (!names.has(`${newCxId}.jsonl`)) {
+    throw new Error('migration did not produce codex file ' + newCxId)
+  }
+  log('OK — legacy mixed-agent file split on boot:')
+  log('  claude id =', newCcId)
+  log('  codex  id =', newCxId)
+}
 
 async function request(method, path, body) {
   const res = await fetch(`http://127.0.0.1:${PROXY_PORT}${path}`, {
@@ -600,8 +674,17 @@ if (!anthropicPost.sse.includes('message_stop')) throw new Error('SSE missing me
 await delay(150)
 const list2 = await request('GET', '/api/projects')
 // 3 projects expected: codex-apikey path + codex-oauth path + anthropic.
+// The two split-from-legacy projects exist on disk but their planted
+// interactions carry no tools (= no main interactions) so the default
+// `messageCount > 0` filter hides them. They're verified separately
+// via the filesystem assertion above and the showAll listing below.
 if (list2.body.length !== 3) {
-  throw new Error('expected 3 projects after anthropic call, got ' + list2.body.length)
+  throw new Error(
+    'expected 3 projects after anthropic call, got ' +
+      list2.body.length +
+      ': ' +
+      JSON.stringify(list2.body.map((p) => `${p.cwd}|${p.agentType}`)),
+  )
 }
 const anthropicProj = list2.body.find((p) => p.agentType === 'claude-code')
 if (!anthropicProj) throw new Error('claude-code project not found')
@@ -641,7 +724,8 @@ const noisePost = await streamPost('/v1/messages', {
 if (noisePost.status !== 200) throw new Error('noise call proxy returned ' + noisePost.status)
 await delay(150)
 const listDefault = await request('GET', '/api/projects')
-// Default list: must still be 3 (the noise project is hidden).
+// Default list: 3 substantive projects (noise project + migrated empty
+// projects all hidden by the messageCount filter).
 if (listDefault.body.length !== 3) {
   throw new Error(
     'expected 3 projects in filtered list, got ' +
@@ -653,11 +737,11 @@ if (listDefault.body.length !== 3) {
 if (listDefault.body.some((p) => p.cwd === NOISE_CWD)) {
   throw new Error('framework-internal project leaked into default list')
 }
-// showAll: must include the noise project.
+// showAll: noise project + the two migrated legacy halves all show up.
 const listAll = await request('GET', '/api/projects?showAll=1')
-if (listAll.body.length !== 4) {
+if (listAll.body.length !== 6) {
   throw new Error(
-    'expected 4 projects with showAll=1, got ' +
+    'expected 6 projects with showAll=1, got ' +
       listAll.body.length +
       ': ' +
       JSON.stringify(listAll.body.map((p) => p.cwd)),
@@ -673,8 +757,155 @@ if (noiseProj.messageCount !== 0) {
 }
 log('OK — framework-internal prompt filtered:')
 log('  default list  =', listDefault.body.length, 'projects')
-log('  showAll list  =', listAll.body.length, 'projects (1 hidden)')
+log('  showAll list  =', listAll.body.length, 'projects (',
+  listAll.body.length - listDefault.body.length, 'hidden)')
 log('  noise project = messageCount=0 on disk, visible via showAll')
+
+// 7. Restart the CLI with the codex upstream re-pointed at the stub so
+//    we can exercise the Responses path again (the anthropic-only
+//    cli2 above has codex routing to a stale env). Re-using the
+//    existing cli2 process is fine — its AGENTMIND_UPSTREAM_OPENAI
+//    still points at UPSTREAM_PORT.
+//
+// AGENTS.md-shadowing regression. The Responses extractor used to
+// match the FIRST `<cwd>…</cwd>` it saw anywhere in the request,
+// which got fooled by repos whose AGENTS.md happened to document
+// the extractor with a literal example. Posting a request whose
+// `input[]` carries an AGENTS.md-flavoured text BEFORE the real
+// `<environment_context>` block is enough to lock the project onto
+// the literal `…` cwd. Verify the regex now requires the env_context
+// container.
+log('AGENTS.md shadowing regression (env_context-scoped cwd extractor)...')
+const SHADOW_CWD = '/private/var/codex-shadow-smoke/' + Math.random().toString(36).slice(2, 8)
+const shadowBody = {
+  model: 'gpt-5-codex',
+  instructions: 'You are Codex.',
+  input: [
+    {
+      type: 'message',
+      role: 'user',
+      content: [
+        {
+          // Mimic AGENTS.md content quoting the extractor regex.
+          // Pre-fix, this `<cwd>…</cwd>` would win and the project
+          // would anchor on cwd="…" (U+2026).
+          type: 'input_text',
+          text:
+            '# AGENTS.md\n\nWe extract cwd via the regex matching ' +
+            '`<cwd>…</cwd>` inside Codex requests.\n',
+        },
+      ],
+    },
+    {
+      type: 'message',
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text:
+            '<environment_context>\n' +
+            `  <cwd>${SHADOW_CWD}</cwd>\n` +
+            '  <shell>zsh</shell>\n' +
+            '</environment_context>',
+        },
+      ],
+    },
+    {
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: 'hi' }],
+    },
+  ],
+  tools: codexBody.tools,
+  tool_choice: 'auto',
+  parallel_tool_calls: true,
+  store: false,
+  stream: true,
+  include: [],
+}
+const shadowPost = await streamPost('/v1/responses', shadowBody)
+if (shadowPost.status !== 200) throw new Error('shadow call returned ' + shadowPost.status)
+await delay(150)
+const listShadow = await request('GET', '/api/projects')
+const shadowProj = listShadow.body.find((p) => p.cwd === SHADOW_CWD)
+if (!shadowProj) {
+  throw new Error(
+    'env_context-scoped cwd missing from list — extractor probably ' +
+      'matched AGENTS.md literal instead. cwds: ' +
+      JSON.stringify(listShadow.body.map((p) => p.cwd)),
+  )
+}
+if (listShadow.body.some((p) => p.cwd === '\u2026')) {
+  throw new Error('extractor leaked U+2026 cwd despite env_context scoping')
+}
+log('OK — env_context scoping wins over AGENTS.md literal:')
+log('  shadow project cwd =', shadowProj.cwd)
+
+// 8. (cwd, agent) projectId scoping. Pre-0.2.2 the projectId was just
+//    sha(cwd), so running both `claude` and `codex` from the same
+//    directory merged their traffic into a single project — with a
+//    single primaryAgent badge that lied about half the messages.
+//    Verify the same cwd now yields two distinct projects.
+log('cwd-agent scoping check (two agents, one cwd -> two projects)...')
+const MIXED_CWD = '/private/var/agentmind-mixed-smoke/' + Math.random().toString(36).slice(2, 8)
+const mixedClaudePost = await streamPost('/v1/messages', {
+  model: 'claude-3-5-sonnet-test',
+  max_tokens: 100,
+  stream: true,
+  system: `You are Claude. cwd: ${MIXED_CWD}`,
+  tools: [{ name: 'noop', description: 'noop', input_schema: { type: 'object' } }],
+  messages: [{ role: 'user', content: 'hi from claude' }],
+})
+if (mixedClaudePost.status !== 200) throw new Error('mixed claude returned ' + mixedClaudePost.status)
+const mixedCodexBody = {
+  ...codexBody,
+  input: [
+    {
+      type: 'message',
+      role: 'user',
+      content: [
+        {
+          type: 'input_text',
+          text:
+            '<environment_context>\n' +
+            `  <cwd>${MIXED_CWD}</cwd>\n` +
+            '  <shell>zsh</shell>\n' +
+            '</environment_context>',
+        },
+      ],
+    },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi from codex' }] },
+  ],
+}
+const mixedCodexPost = await streamPost('/v1/responses', mixedCodexBody)
+if (mixedCodexPost.status !== 200) throw new Error('mixed codex returned ' + mixedCodexPost.status)
+await delay(200)
+const listMixed = await request('GET', '/api/projects')
+const projectsAtMixedCwd = listMixed.body.filter((p) => p.cwd === MIXED_CWD)
+if (projectsAtMixedCwd.length !== 2) {
+  throw new Error(
+    'expected 2 projects at MIXED_CWD (one per agent), got ' +
+      projectsAtMixedCwd.length +
+      ': ' +
+      JSON.stringify(projectsAtMixedCwd.map((p) => p.agentType)),
+  )
+}
+const agentsAtMixedCwd = new Set(projectsAtMixedCwd.map((p) => p.agentType))
+if (!agentsAtMixedCwd.has('claude-code') || !agentsAtMixedCwd.has('codex-cli')) {
+  throw new Error(
+    'expected one claude-code and one codex-cli project at the same cwd, got: ' +
+      JSON.stringify([...agentsAtMixedCwd]),
+  )
+}
+// And the two projectIds must actually differ (otherwise they'd
+// stomp each other on disk).
+const [pA, pB] = projectsAtMixedCwd
+if (pA.projectId === pB.projectId) {
+  throw new Error('same cwd produced identical projectIds for two agents: ' + pA.projectId)
+}
+log('OK — (cwd, agent) scoping yields two projects:')
+log('  claude project =', projectsAtMixedCwd.find((p) => p.agentType === 'claude-code').projectId)
+log('  codex  project =', projectsAtMixedCwd.find((p) => p.agentType === 'codex-cli').projectId)
 
 cli2.kill('SIGINT')
 upstream.close()

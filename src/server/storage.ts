@@ -2,8 +2,13 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import { randomUUID } from 'node:crypto'
-import { projectIdForCwd, isProjectIdFilename } from './projectId'
+import {
+  projectIdFor,
+  projectIdForCwdLegacy,
+  isProjectIdFilename,
+} from './projectId'
 import type {
+  AgentType,
   CapturedProject,
   CapturedMessage,
   CapturedInteraction,
@@ -13,8 +18,11 @@ import type {
 // JSONL layout (current):
 //   ~/.agentmind/projects/<projectId>.jsonl
 //
-// Where `projectId = sha256(cwd).slice(0,16)`. One file per cwd; the file
-// accumulates every message + interaction ever captured for that cwd.
+// Where `projectId = sha256(cwd \0 agent).slice(0,16)`. One file per
+// (cwd, agent) pair; the file accumulates every message + interaction
+// ever captured for that agent in that working directory. A developer
+// who runs both `claude` and `codex` in /foo gets two project files
+// (one per agent), each containing only its own agent's traffic.
 //
 // Each line is one record:
 //   {type: "project",     ...}   one or more (last one wins per field)
@@ -25,13 +33,13 @@ import type {
 // response-end). We don't seek-and-replace — the reader merges by
 // interactionId, last-wins. Simple, crash-safe.
 //
-// Legacy on read:
+// Legacy on read (one-shot migrated on Storage init):
 //   - `~/.agentmind/sessions/`  (renamed → `projects/`)
 //   - `{type:"session", sessionId, …}` records (translated → project)
 //   - `sessionId` field on message/interaction records (read as projectId)
-// All legacy data is one-shot migrated on Storage init: same-cwd files
-// are merged into the new cwd-keyed file with their records rewritten
-// to the new schema, then the source file is removed.
+//   - pre-0.2.2 files keyed by `sha256(cwd)` only — when these contain
+//     interactions from multiple agents we split them per agent; when
+//     they're single-agent we just rename them to the new id scheme.
 
 const DEFAULT_DATA_DIR = path.join(os.homedir(), '.agentmind')
 
@@ -162,11 +170,25 @@ export class Storage {
     }
 
     if (!fs.existsSync(this.projectsDir)) return
+    // Pass 1: pre-projectId-format files (UUID names from the
+    // pre-0.1 sessions/ era). These get bucketed into legacy
+    // cwd-only ids first; pass 2 then re-keys them.
     for (const name of fs.readdirSync(this.projectsDir)) {
       if (!name.endsWith('.jsonl')) continue
       const base = name.slice(0, -'.jsonl'.length)
       if (isProjectIdFilename(base)) continue
       this.migrateOneLegacyFile(name)
+    }
+    // Pass 2: re-key any file whose name doesn't match the new
+    // `sha(cwd, agent)` scheme — i.e. pre-0.2.2 cwd-only ids, or
+    // mixed-agent files born from a single cwd that ran both
+    // `claude` and `codex`. We can detect both by recomputing the
+    // expected id from the file's actual contents.
+    for (const name of fs.readdirSync(this.projectsDir)) {
+      if (!name.endsWith('.jsonl')) continue
+      const base = name.slice(0, -'.jsonl'.length)
+      if (!isProjectIdFilename(base)) continue
+      this.maybeReKeyByAgent(name)
     }
   }
 
@@ -198,12 +220,14 @@ export class Storage {
     }
     if (!cwd) return
 
-    const projectId = projectIdForCwd(cwd)
+    // Stage 1 of migration only — emit using the LEGACY (cwd-only) id
+    // so pass 2 can pick the file up and split it per-agent. Going
+    // straight to the per-agent id here would mis-bucket mixed-agent
+    // legacy files (they'd all end up tagged with whichever agent the
+    // header claims, while the interactions span multiple).
+    const projectId = projectIdForCwdLegacy(cwd)
     const dst = path.join(this.projectsDir, `${projectId}.jsonl`)
 
-    // Translate each record to the new schema with the freshly-minted
-    // projectId. The source file's UUID-style id is discarded; everything
-    // for this cwd now points at the canonical projectId.
     const rewritten: string[] = []
     for (const { rec } of parsed) {
       const next: any = { ...rec, projectId }
@@ -211,8 +235,120 @@ export class Storage {
       if ((rec as any).type === 'session') next.type = 'project'
       rewritten.push(JSON.stringify(next))
     }
-    rewritten.push('') // trailing newline
+    rewritten.push('')
     fs.appendFileSync(dst, rewritten.join('\n'), 'utf8')
+    try { fs.unlinkSync(src) } catch {}
+  }
+
+  // Re-key one project file from the legacy `sha(cwd)`-only scheme to
+  // the current `sha(cwd, agent)` scheme. If the file's interactions
+  // span multiple agents (a developer ran both `claude` and `codex`
+  // in the same dir before 0.2.2), split it into N files — one per
+  // agent — each carrying only that agent's records.
+  private maybeReKeyByAgent(filename: string) {
+    const src = path.join(this.projectsDir, filename)
+    const oldId = filename.slice(0, -'.jsonl'.length)
+    let text: string
+    try {
+      text = fs.readFileSync(src, 'utf8')
+    } catch {
+      return
+    }
+    const lines = text.split('\n').filter((l) => l.length > 0)
+    if (!lines.length) {
+      try { fs.unlinkSync(src) } catch {}
+      return
+    }
+
+    // Walk the file once. We need: cwd, primaryAgent (from header),
+    // per-interaction agentType, and a map messageId → agentType so we
+    // can route the message records too.
+    let cwd: string | undefined
+    let headerAgent: AgentType | undefined
+    let header: any
+    const recsByType: { project: any[]; message: any[]; interaction: any[] } = {
+      project: [],
+      message: [],
+      interaction: [],
+    }
+    const msgAgent = new Map<string, AgentType>()
+    for (const line of lines) {
+      const p = parseLegacyRecord(line, oldId)
+      if (!p) continue
+      const rec: any = p.rec
+      if (rec.type === 'project') {
+        recsByType.project.push(rec)
+        if (!cwd && p.cwdHint) cwd = p.cwdHint
+        if (!headerAgent && rec.primaryAgent) headerAgent = rec.primaryAgent
+        header = rec
+      } else if (rec.type === 'message') {
+        recsByType.message.push(rec)
+      } else if (rec.type === 'interaction') {
+        recsByType.interaction.push(rec)
+        if (!cwd && p.cwdHint) cwd = p.cwdHint
+        const ag: AgentType = rec.agentType ?? headerAgent ?? 'claude-code'
+        if (rec.messageId) msgAgent.set(rec.messageId, ag)
+      }
+    }
+
+    // Fall back to whatever the header reports if no interaction or
+    // header carried a cwd hint. Without ANY cwd we can't compute a
+    // new id — leave the file alone (sidebar still surfaces it under
+    // the old id; the user will see it but can't get per-agent
+    // splitting until they next touch the project).
+    if (!cwd && header?.cwd) cwd = header.cwd
+    if (!cwd) return
+
+    // If the file is already at the correct (cwd, agent) id AND
+    // contains only one agent, nothing to do.
+    const interactionAgents = new Set<AgentType>()
+    for (const it of recsByType.interaction) {
+      interactionAgents.add(it.agentType ?? headerAgent ?? 'claude-code')
+    }
+    if (interactionAgents.size === 0 && headerAgent) {
+      interactionAgents.add(headerAgent)
+    }
+    if (interactionAgents.size === 1) {
+      const onlyAgent = [...interactionAgents][0]!
+      const expectedId = projectIdFor(cwd, onlyAgent)
+      if (expectedId === oldId) return // already correct
+    }
+
+    // Split: for each agent represented in this file, emit a new
+    // project file with all records belonging to that agent. Project
+    // headers get cloned and stamped with the agent. Messages route
+    // by the agentType of their interactions (msgAgent map).
+    for (const agent of interactionAgents) {
+      const newId = projectIdFor(cwd, agent)
+      const dst = path.join(this.projectsDir, `${newId}.jsonl`)
+      const out: string[] = []
+
+      // Clone project header for this agent
+      const baseHeader = header ?? { type: 'project' }
+      const ph: any = {
+        ...baseHeader,
+        type: 'project',
+        projectId: newId,
+        cwd,
+        primaryAgent: agent,
+      }
+      delete ph.sessionId
+      out.push(JSON.stringify(ph))
+
+      for (const m of recsByType.message) {
+        const mAgent = msgAgent.get(m.messageId) ?? headerAgent ?? agent
+        if (mAgent !== agent) continue
+        out.push(JSON.stringify({ ...m, projectId: newId }))
+      }
+      for (const it of recsByType.interaction) {
+        const itAgent: AgentType = it.agentType ?? headerAgent ?? agent
+        if (itAgent !== agent) continue
+        out.push(JSON.stringify({ ...it, projectId: newId, agentType: itAgent }))
+      }
+      out.push('')
+      fs.appendFileSync(dst, out.join('\n'), 'utf8')
+    }
+
     try { fs.unlinkSync(src) } catch {}
   }
 }

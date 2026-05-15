@@ -32,6 +32,15 @@
   --tool: oklch(0.74 0.14 200);
   --thinking: oklch(0.72 0.18 320);
   --subagent: oklch(0.72 0.18 320);
+
+  /* Per-agent brand tints. Used for the sidebar badge. Both
+     deliberately muted (low chroma) — they mark provenance without
+     competing with the green `live` / red `error` accents for the
+     eye's attention.
+       claude  → warm muted orange (Anthropic's brand peach)
+       codex   → soft purple (community-associated Codex/OpenAI hue) */
+  --agent-claude: oklch(0.68 0.12 60);
+  --agent-codex: oklch(0.68 0.13 290);
 }
 
 @theme inline {

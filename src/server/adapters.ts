@@ -124,29 +124,38 @@ class ResponsesAdapter implements ProtocolAdapter {
   //   </environment_context>
   //
   // Single-environment path uses a top-level <cwd>; multi-env wraps each
-  // in <environment id="…"><cwd>…</cwd>…</environment>. Either way the
-  // first <cwd>…</cwd> in the request text is the one we want. Source
-  // truth: openai/codex:codex-rs/core/src/context/environment_context.rs.
+  // in <environment id="…"><cwd>…</cwd>…</environment>. Source truth:
+  // openai/codex:codex-rs/core/src/context/environment_context.rs.
   //
-  // We search both `instructions` and every text part of `input[]` — the
-  // env block is normally injected as a user-role input message rather
-  // than into instructions.
+  // We REQUIRE the `<cwd>` to sit inside an `<environment_context>`
+  // block. A bare `/<cwd>([^<\n]+)<\/cwd>/` looks tempting but bites
+  // hard: Codex injects each repo's AGENTS.md into the same `input[]`
+  // as the env-context block (and earlier in the list). If AGENTS.md
+  // happens to discuss this extractor and contains a literal example
+  // like `<cwd>…</cwd>` for documentation, the un-scoped regex hits
+  // the docs example first and anchors the entire project on the
+  // wrong cwd. This was exactly what produced the "all my Codex
+  // sessions live under cwd=… (U+2026)" report.
+  //
+  // Scan order: walk `input[]` from the END backwards so the freshest
+  // env block wins on the (very rare) chance multiple appear. Fall
+  // back to `instructions` last because Codex doesn't put env_context
+  // there in practice.
   extractCwd(req: unknown): string | undefined {
     const r = req as ResponsesRequest | undefined
     if (!r) return undefined
-    const candidates: string[] = []
-    if (typeof r.instructions === 'string') candidates.push(r.instructions)
+    const texts: string[] = []
     for (const item of r.input ?? []) {
       if (item.type !== 'message') continue
       for (const c of item.content ?? []) {
         if (c.type === 'input_text' || c.type === 'output_text') {
-          candidates.push((c as { text: string }).text)
+          texts.push((c as { text: string }).text)
         }
       }
     }
-    for (const text of candidates) {
-      const m = text.match(/<cwd>([^<\n]+)<\/cwd>/)
-      const cwd = m?.[1]?.trim()
+    if (typeof r.instructions === 'string') texts.push(r.instructions)
+    for (let i = texts.length - 1; i >= 0; i--) {
+      const cwd = cwdFromEnvContextBlock(texts[i])
       if (cwd) return cwd
     }
     return undefined
@@ -186,6 +195,18 @@ class ResponsesAdapter implements ProtocolAdapter {
   createAccumulator(): SseAccumulatorLike {
     return new ResponsesSseAccumulator() as unknown as SseAccumulatorLike
   }
+}
+
+// Pull `<cwd>X</cwd>` out of an `<environment_context>…</environment_context>`
+// block. Anything ouside that container is ignored — see the long comment
+// on ResponsesAdapter.extractCwd for why.
+function cwdFromEnvContextBlock(text: string): string | undefined {
+  if (!text.includes('<environment_context')) return undefined
+  // `[\s\S]*?` keeps it non-greedy so we don't span across two blocks.
+  const m = text.match(
+    /<environment_context[^>]*>[\s\S]*?<cwd>([^<\n]+)<\/cwd>[\s\S]*?<\/environment_context>/,
+  )
+  return m?.[1]?.trim() || undefined
 }
 
 function normaliseInputItem(item: ResponsesInputItem): MessageParam | undefined {
