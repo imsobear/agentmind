@@ -37,7 +37,7 @@ import type {
 //   - `~/.agentmind/sessions/`  (renamed → `projects/`)
 //   - `{type:"session", sessionId, …}` records (translated → project)
 //   - `sessionId` field on message/interaction records (read as projectId)
-//   - pre-0.2.2 files keyed by `sha256(cwd)` only — when these contain
+//   - pre-0.2.0 files keyed by `sha256(cwd)` only — when these contain
 //     interactions from multiple agents we split them per agent; when
 //     they're single-agent we just rename them to the new id scheme.
 
@@ -180,7 +180,7 @@ export class Storage {
       this.migrateOneLegacyFile(name)
     }
     // Pass 2: re-key any file whose name doesn't match the new
-    // `sha(cwd, agent)` scheme — i.e. pre-0.2.2 cwd-only ids, or
+    // `sha(cwd, agent)` scheme — i.e. pre-0.2.0 cwd-only ids, or
     // mixed-agent files born from a single cwd that ran both
     // `claude` and `codex`. We can detect both by recomputing the
     // expected id from the file's actual contents.
@@ -243,7 +243,7 @@ export class Storage {
   // Re-key one project file from the legacy `sha(cwd)`-only scheme to
   // the current `sha(cwd, agent)` scheme. If the file's interactions
   // span multiple agents (a developer ran both `claude` and `codex`
-  // in the same dir before 0.2.2), split it into N files — one per
+  // in the same dir before 0.2.0), split it into N files — one per
   // agent — each carrying only that agent's records.
   private maybeReKeyByAgent(filename: string) {
     const src = path.join(this.projectsDir, filename)

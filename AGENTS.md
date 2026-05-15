@@ -7,48 +7,65 @@ it's there, link to it.
 
 ## Status notes (read first)
 
-- The multi-agent layer landed in v0.2: capture both `/v1/messages`
+- The multi-agent layer landed in v0.2.0: capture both `/v1/messages`
   (Anthropic Messages API) and `/v1/responses` (OpenAI Responses API)
   through the same project/message/interaction model. See `Multi-agent
   architecture` below before touching `proxy.ts`, `grouping.ts`, or
   `aggregate.ts`.
-- Action segments are only computed for Claude Code (Anthropic).
-  Computing the equivalent `function_call`→`function_call_output`
-  pairing for Codex is on the v0.3 list — see the early-return in
-  `aggregate.computeActionSegments`.
+- Projects are keyed by **(cwd, agent)** since v0.2.0. `projectId =
+  sha256(cwd \0 agent).slice(0,16)`. Two agents in the same cwd produce
+  two distinct projects. Pre-0.2.0 single-cwd files are re-keyed (or
+  split per-agent for mixed-agent files) by a one-shot migration at
+  `Storage` boot — `maybeReKeyByAgent` in `storage.ts`.
+- Action segments are computed for **both** agents. Anthropic pairs
+  `tool_use` ↔ `tool_result`; Codex pairs `function_call` ↔
+  `function_call_output` (also `custom_tool_call*` variants) — see
+  `computeActionSegmentsResponses` in `aggregate.ts`. Codex shell-tool
+  output is JSON-envelope-unwrapped for the preview.
+- `agentmind-cli` defaults to launching **Claude Code** as of v0.2.1.
+  Old dashboard-only behaviour is behind `--no-agent`. The launcher's
+  dispatch logic lives in `bin/cli.js`.
 
 ## Core data model
 
 ```
-project (cwd, agnostic of agent)
+project (cwd, agent) ─ single-agent by construction
   └── message (one user prompt)
-        └── interaction (one HTTP round-trip, tagged with agentType)
+        └── interaction (one HTTP round-trip)
               ├── request / response   ← shape varies by agentType
-              └── action segment       ← Anthropic-only today
+              └── action segment       ← both agents now
 ```
 
-- **project** — pure cwd → project, no idle window: every request from
-  the same working directory, across runs and across days, lands in the
-  same project. `projectId = sha256(cwd).slice(0,16)` — see
-  `src/server/projectId.ts`. Each project stamps `primaryAgent` at
-  creation time (the first agent that wrote to it); per-interaction
-  `agentType` records the true protocol for that specific round-trip
-  so a mixed-agent project (claude in cwd today, codex tomorrow) still
-  renders both correctly. Helper calls without their own cwd attach to
-  the most recent cwd this proxy process saw.
+- **project** — keyed by `(cwd, agent)`, no idle window: every request
+  from the same agent in the same working directory, across runs and
+  days, lands in the same project. `projectId = sha256(cwd \0
+  agent).slice(0,16)` — see `src/server/projectId.ts`. Two different
+  agents in the same cwd produce two distinct projects with two
+  distinct message chains. `primaryAgent` on the project record is
+  always the same agent the projectId hash includes; per-interaction
+  `agentType` is redundant under the new scheme but kept for read-side
+  compatibility with pre-0.2.0 records. Helper calls that don't carry
+  their own cwd attach to the most recent cwd **for that same agent**
+  the proxy saw (per-agent `lastCwd`, not global) — otherwise a Codex
+  helper would accidentally land in a recent Claude project.
 - **message** — opens when the request's transcript (Anthropic
   `messages` / Responses `input`, normalised through the protocol
   adapter) isn't a prefix-extension of any existing message in the
   project, OR the appended slice contains a new user-typed prompt.
 - **interaction** — one HTTP round-trip. An N-step ReAct loop = N
   interactions on the same message. Carries `agentType` ∈
-  `'claude-code' | 'codex-cli' | 'unknown'` — pre-0.2 records lack
-  this field, readers must default to `'claude-code'`.
-- **action segment** — reconstructed by pairing iter N's `tool_use`
-  blocks with iter N+1's `tool_result` blocks; see
-  `aggregate.ts:computeActionSegments`. **Anthropic only today** — the
-  function builds nothing for Codex traffic and returns `[]`. The gap
-  duration is the local tool-execution wall-clock.
+  `'claude-code' | 'codex-cli' | 'unknown'`. Pre-0.2.0 records lack
+  this field; readers default to `'claude-code'`. Mixed-agent legacy
+  files are split at `Storage` boot so production code never sees a
+  multi-agent file.
+- **action segment** — reconstructed by pairing iter N's tool-call
+  blocks with iter N+1's tool-result blocks. Anthropic pairs
+  `tool_use`/`tool_result` (`computeActionSegments`); Codex pairs
+  `function_call`/`function_call_output` plus the `custom_tool_call*`
+  variants (`computeActionSegmentsResponses`). Codex `shell` output is
+  JSON-envelope-unwrapped (`{output, metadata:{exit_code}}` → preview =
+  `output`, non-zero exit = `isError`). The gap duration is the local
+  tool-execution wall-clock.
 
 Neither protocol carries a project/session header — everything above
 is **inferred** from request shape, by the protocol adapter. Read the
@@ -158,8 +175,12 @@ recipe in the README.
 ## Launcher subcommands
 
 `bin/cli.js` accepts two subcommands that take the manual env / config
-dance off the user's plate:
+dance off the user's plate. **As of v0.2.1 `claude` is the implicit
+default** — `agentmind-cli` with no subcommand is `agentmind-cli
+claude`, and dashboard-only mode requires the explicit `--no-agent`
+flag.
 
+- `agentmind-cli` (no subcommand) → same as `agentmind-cli claude`.
 - `agentmind-cli claude [args…]` — boots the dashboard, then `spawn`s
   `claude` with `ANTHROPIC_BASE_URL` injected. Trivial.
 - `agentmind-cli codex [args…]` — boots the dashboard, then `spawn`s
@@ -211,28 +232,36 @@ manual on purpose — devs hacking on agentmind don't need wrappers.
 Smoke coverage: `scripts/smoke-launcher.mjs` shims `codex` and
 `claude` on `PATH` with a node script that records its argv + env,
 then asserts the launcher invoked them with the expected overrides.
-Skipped on Windows (the PATH-shim trick needs `.cmd` plumbing).
+It also asserts that bare `agentmind-cli` (no subcommand) hits the
+Claude shim — i.e. the v0.2.1 default. Skipped on Windows (the
+PATH-shim trick needs `.cmd` plumbing). The matching dashboard-only
+e2e lives in `scripts/smoke-codex.mjs`; both run from `pnpm smoke`
+(which now does `pnpm build` first — the smoke test exercises the
+built CLI, not the source).
 
 ### cwd extraction recipe per agent
 
 | Agent       | Where the cwd lives                                                    |
 | ----------- | ---------------------------------------------------------------------- |
 | Claude Code | `system` prompt text. Match `/(?:cwd|working_?directory)\s*[:=]\s*(.+)/i`. |
-| Codex CLI   | An `<environment_context><cwd>…</cwd>…</environment_context>` XML-ish block injected as a user-role input message. Match `/<cwd>([^<\n]+)<\/cwd>/`. Source: `openai/codex:codex-rs/core/src/context/environment_context.rs`. |
+| Codex CLI   | An `<environment_context>…<cwd>…</cwd>…</environment_context>` XML-ish block injected as a user-role input message. The regex **must** be scoped to the env-context block (`/<environment_context[^>]*>[\s\S]*?<cwd>([^<\n]+)<\/cwd>[\s\S]*?<\/environment_context>/`) — a bare `<cwd>…</cwd>` match anchors on AGENTS.md doc examples that Codex injects earlier in `input[]` and produces nonsense cwds. Scan `input[]` from the **end backwards** so the freshest env block wins. Source: `openai/codex:codex-rs/core/src/context/environment_context.rs`. |
 
 ## Two state lanes
 
 Persisted and realtime are decoupled. Both lanes must stay correct:
 
 - **Persisted** — append-only JSONL at `~/.agentmind/projects/<projectId>.jsonl`.
-  `projectId` is `sha256(cwd).slice(0,16)`, so the same cwd always lands
-  in the same file. Two writes per interaction: partial (request only)
-  at start, final (request + response + sseEvents) at stream end.
-  Reader merges last-wins on `interactionId`. Never seek-and-rewrite.
-  Legacy `~/.agentmind/sessions/` + `{type:"session", sessionId}`
-  records are one-shot migrated into the new layout on Storage init
-  (see `migrateLegacy` in `storage.ts`); reads also tolerate them in
-  place if the migration couldn't move a file.
+  `projectId` is `sha256(cwd \0 agent).slice(0,16)`, so each (cwd,
+  agent) pair always lands in the same file. Two writes per
+  interaction: partial (request only) at start, final (request +
+  response + sseEvents) at stream end. Reader merges last-wins on
+  `interactionId`. Never seek-and-rewrite. Legacy migration is two
+  passes in `migrateLegacy`/`maybeReKeyByAgent` (`storage.ts`): pass 1
+  renames pre-0.1.x UUID files to the (then-canonical) `sha256(cwd)`
+  layout; pass 2 re-keys any single-agent `sha256(cwd)` file to the
+  new `sha256(cwd, agent)` name and **splits** any mixed-agent file
+  into one file per agent. After boot, no on-disk file is ever multi-
+  agent. Both passes are idempotent.
 - **Realtime** — `LiveRegistry` in-process map (lost on restart). The
   proxy feeds every upstream chunk through a `LiveSession`; the
   registry re-emits throttled (150ms per iid) `live-update` and
@@ -275,10 +304,15 @@ the heuristic needs to differ between agents.
   not by matching typography — see the existing pattern in
   `__root.tsx` ↔ `MessagesPane.tsx`.
 - **Storage records are forever.** Don't change a record shape without
-  also handling old records on read.
-- **No tests yet.** Verify with `pnpm typecheck` + manual smoke via
-  `pnpm dev`. Add tests only for genuinely test-worthy logic (SSE
-  parser, grouping rules) — don't pad coverage.
+  also handling old records on read **and** extending
+  `migrateLegacy`/`maybeReKeyByAgent` if the on-disk filename scheme
+  is what's changing.
+- **Tests live in `scripts/smoke-*.mjs`.** `pnpm typecheck` for fast
+  iteration, `pnpm smoke` (build + e2e) for anything touching
+  `server/` or `bin/cli.js`. The smoke harness covers Codex capture,
+  Anthropic regression, `(cwd, agent)` scoping, the legacy
+  split-on-boot, and launcher argv/env injection. Add new cases there
+  rather than introducing a unit-test framework.
 - **Half-baked beats polished.** When a feature feels "off", the
   default move is to delete it and rethink, not iterate. Confirm
   direction before polishing.
@@ -361,10 +395,15 @@ confirmed the PR summary.**
 ## Verifying a change
 
 1. `pnpm typecheck` must be clean.
-2. If you touched `server/`: trace one streaming round-trip end-to-end
-   in your head — request → partial write → `onEvent` → upstream stream
-   → `live.feed` → final write → `onEvent`. Check every error path
-   cleans up the `LiveSession`.
-3. If you touched UI: run `pnpm dev`, observe **both** an in-flight
+2. If you touched `server/` or `bin/cli.js`: run `pnpm smoke`. It
+   does `pnpm build` first, then runs `scripts/smoke-codex.mjs`
+   (Codex capture + Anthropic regression + `(cwd, agent)` scoping +
+   legacy split-on-boot) and `scripts/smoke-launcher.mjs` (launcher
+   argv/env injection + bare-`agentmind-cli` default).
+3. If you touched `server/`: also trace one streaming round-trip
+   end-to-end in your head — request → partial write → `onEvent` →
+   upstream stream → `live.feed` → final write → `onEvent`. Check
+   every error path cleans up the `LiveSession`.
+4. If you touched UI: run `pnpm dev`, observe **both** an in-flight
    iter and a completed one. Regressions tend to surface in only one
    phase.

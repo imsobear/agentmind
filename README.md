@@ -153,8 +153,10 @@ All capture is local-first JSONL — never leaves your machine.
 
 One file per `(cwd, agent)` pair — every `claude` run in the same
 directory appends to the Claude file for that cwd, every `codex` run
-to the Codex file. Pre-0.2.2 single-cwd files are migrated to the new
-scheme on first boot. Each line is one JSON record:
+to the Codex file. Pre-0.2.0 single-cwd files are migrated to the new
+scheme on first boot (a two-pass split runs at startup: same-agent
+files get re-keyed, mixed-agent files are split per agent). Each line
+is one JSON record:
 
 | `type`        | When written                              | Purpose                          |
 | ------------- | ----------------------------------------- | -------------------------------- |
@@ -167,19 +169,24 @@ share a JSONL with a teammate without leaking your key.
 
 ## Privacy & safety
 
-- **Local only.** AgentMind binds to `127.0.0.1`. There is no outbound
-  traffic except the proxied call to `api.anthropic.com` your agent was
-  going to make anyway.
+- **Local only.** AgentMind binds to `127.0.0.1`. The only outbound
+  traffic is the proxied call your agent was going to make anyway —
+  `api.anthropic.com` for Claude Code, `api.openai.com` or
+  `chatgpt.com/backend-api/codex` for Codex CLI (we route by the
+  bearer-token shape, not by config).
 - **No telemetry.** Not now, not later. The only network calls are the ones
   you can see in the inspector.
 - **Read-only on disk.** Captured JSONL is append-only; AgentMind never
-  edits or deletes files you didn't ask it to.
+  edits or deletes files you didn't ask it to. The one exception is the
+  one-shot legacy migration at startup, which rewrites pre-0.2.0 files
+  into the new `(cwd, agent)` layout — see `migrateLegacy` in
+  `src/server/storage.ts`.
 
 ## Supported agents
 
 | Agent                            | Status                                |
 | -------------------------------- | ------------------------------------- |
-| Claude Code                      | First-class, fully tested — `agentmind-cli claude` |
+| Claude Code                      | First-class (default) — `agentmind-cli` |
 | Claude SDK / API direct callers  | Works — see [Manual setup](#manual-setup) |
 | Codex CLI                        | First-class (v0.2+) — `agentmind-cli codex` |
 | OpenCode                         | Roadmap                               |
@@ -225,6 +232,7 @@ uses internally:
 ```bash
 codex \
   -c 'model_provider="agentmind"' \
+  -c 'model_providers.agentmind.name="AgentMind"' \
   -c 'model_providers.agentmind.base_url="http://127.0.0.1:8088/v1"' \
   -c 'model_providers.agentmind.requires_openai_auth=true' \
   -c 'model_providers.agentmind.wire_api="responses"' \
@@ -289,14 +297,19 @@ src/
     ├── middleware.ts             Connect middleware (mounted in vite.config.ts)
     ├── proxy.ts                  generic forwarder + SSE tee (per adapter)
     ├── liveRegistry.ts           in-memory live-streaming sessions
-    ├── grouping.ts               cwd-based project/message inference
+    ├── grouping.ts               (cwd, agent)-based project/message inference
+    ├── projectId.ts              sha256(cwd, agent) ↔ projectId
     ├── aggregate.ts              raw capture → display model
     ├── interaction-view.ts       per-protocol view extractors
     ├── sse.ts                    Anthropic SSE parser
     ├── responses-sse.ts          OpenAI Responses SSE parser
-    └── storage.ts                JSONL persistence
+    ├── prod-entry.ts             production CLI entrypoint (bundled into dist/)
+    └── storage.ts                JSONL persistence + one-shot legacy migration
 
-bin/cli.js                        global `agentmind-cli` entry
+bin/cli.js                        global `agentmind-cli` entry (launches
+                                  Claude by default, or `codex` / `--no-agent`)
+scripts/smoke-codex.mjs           e2e capture smoke (Codex + Anthropic + migration)
+scripts/smoke-launcher.mjs        PATH-shim launcher smoke
 ```
 
 ## Development
@@ -307,6 +320,7 @@ pnpm dev          # http://127.0.0.1:8088 with HMR (uses vite)
 pnpm typecheck    # strict tsc --noEmit
 pnpm build        # produces dist/ — what npm publishes
 pnpm start        # run the production bundle locally (no vite)
+pnpm smoke        # build + end-to-end smoke (Codex + Anthropic + launcher)
 ```
 
 The published package ships a prebuilt `dist/` — end users running
@@ -326,8 +340,9 @@ Optional env vars (testing/dev only — not user-facing):
 
 ## Roadmap
 
-- [x] OpenAI Responses API capture (Codex CLI) — v0.2
-- [ ] Codex CLI: action segments (function_call → function_call_output pairing)
+- [x] OpenAI Responses API capture (Codex CLI) — v0.2.0
+- [x] Codex CLI: action segments (function_call → function_call_output pairing) — v0.2.0
+- [x] Default `agentmind-cli` to launching Claude Code — v0.2.1
 - [ ] Codex CLI: helper-call filtering (compaction summariser)
 - [ ] OpenCode CLI adapter
 - [ ] Cross-project search & filters
