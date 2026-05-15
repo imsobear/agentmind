@@ -31,6 +31,19 @@ import type {
   CapturedInteraction,
   CapturedMessage,
 } from '../lib/anthropic-types'
+import type {
+  ResponsesObject,
+  ResponsesRequest,
+  ResponsesOutputItem,
+  ResponsesInputItem,
+  ResponsesFunctionCallItem,
+  ResponsesCustomToolCallItem,
+  ResponsesLocalShellCallItem,
+  ResponsesWebSearchCallItem,
+  ResponsesImageGenerationCallItem,
+  ResponsesToolSearchCallItem,
+  FunctionCallOutputPayload,
+} from '../lib/openai-responses-types'
 import {
   agentTypeOf,
   isMainInteractionFor,
@@ -266,14 +279,12 @@ function flattenResultContent(content: unknown): {
 }
 
 export function computeActionSegments(its: CapturedInteraction[]): ActionSegment[] {
-  // Action segments are currently only computed for Anthropic
-  // interactions — the tool_use/tool_result pairing is bespoke to that
-  // shape (see implementation below). For Codex CLI's Responses-API
-  // traffic the equivalent pairing (function_call → function_call_output)
-  // is reconstructible but not implemented in 0.2.0; segments stay
-  // empty for those messages and the UI falls back to the per-iter card
-  // view. Tracked as a polish ticket for 0.3.
-  if (its.length && agentTypeOf(its[0]) !== 'claude-code') return []
+  // Dispatch on protocol. The two implementations build the same
+  // `ActionSegment[]` shape so the UI doesn't care which agent emitted
+  // the traffic — only the pairing keys & payload extraction differ.
+  if (its.length && agentTypeOf(its[0]) === 'codex-cli') {
+    return computeActionSegmentsResponses(its)
+  }
   const segments: ActionSegment[] = []
   for (let i = 0; i < its.length; i++) {
     const cur = its[i]
@@ -359,4 +370,251 @@ export function computeActionSegments(its: CapturedInteraction[]): ActionSegment
     })
   }
   return segments
+}
+
+// ── Action reconstruction · Codex / OpenAI Responses ─────────────────
+//
+// The Anthropic version above pairs `tool_use` (response.content) with
+// `tool_result` (next request.messages[…].user.content) by `tool_use_id`.
+// Codex's Responses-API equivalent is structurally the same, but the
+// names and locations differ:
+//
+//   producer side  (cur.response.output[])
+//     function_call          { call_id, name, arguments: <json string> }
+//     custom_tool_call       { call_id, name, input: <freeform string> }
+//     local_shell_call       { call_id?, action }
+//     web_search_call        { call_id?, action }
+//     image_generation_call  { call_id?, status, revised_prompt? }
+//     tool_search_call       { call_id?, execution, arguments }
+//
+//   consumer side  (next.request.input[])
+//     function_call_output       { call_id, output: <string|content[]> }
+//     custom_tool_call_output    { call_id, output: <string|content[]> }
+//     mcp_tool_call_output       { call_id, output: <unknown> }
+//
+// Pair by `call_id`. Codex's `shell` tool wraps stdout/stderr in a
+// JSON-stringified envelope `{output, metadata:{exit_code,...}}`; we
+// unwrap it for the preview so the user sees command output rather
+// than the wire-format wrapper.
+
+function computeActionSegmentsResponses(its: CapturedInteraction[]): ActionSegment[] {
+  const segments: ActionSegment[] = []
+  for (let i = 0; i < its.length; i++) {
+    const cur = its[i]
+    const curResp = cur.response as ResponsesObject | undefined
+    const output = curResp?.output ?? []
+    const toolCalls: CodexToolCall[] = []
+    for (const item of output) {
+      const t = extractToolCallFromOutput(item)
+      if (t) toolCalls.push(t)
+    }
+    if (toolCalls.length === 0) continue
+
+    const next = its[i + 1]
+    if (!next) {
+      segments.push({
+        fromInteractionId: cur.interactionId,
+        pending: true,
+        actions: toolCalls.map((t) => ({
+          toolUseId: t.callId,
+          name: t.name,
+          input: t.input,
+          isError: false,
+        })),
+      })
+      continue
+    }
+
+    const nextReq = next.request as ResponsesRequest | undefined
+    const inputs = (nextReq?.input ?? []) as ResponsesInputItem[]
+    const resultByCall = new Map<string, ResolvedOutput>()
+    for (const inp of inputs) {
+      const r = extractToolResultFromInput(inp)
+      if (r) resultByCall.set(r.callId, r)
+    }
+
+    const actions: ActionEntry[] = toolCalls.map((t) => {
+      const r = resultByCall.get(t.callId)
+      if (!r) {
+        return {
+          toolUseId: t.callId,
+          name: t.name,
+          input: t.input,
+          isError: false,
+          unmatched: true,
+        }
+      }
+      const truncated = r.text.length > RESULT_PREVIEW_LIMIT
+      return {
+        toolUseId: t.callId,
+        name: t.name,
+        input: t.input,
+        resultPreview: truncated ? r.text.slice(0, RESULT_PREVIEW_LIMIT) : r.text,
+        resultChars: r.chars,
+        resultTruncated: truncated || undefined,
+        isError: r.isError,
+        hasImage: r.hasImage || undefined,
+      }
+    })
+
+    const endedAtMs = cur.endedAt
+      ? new Date(cur.endedAt).getTime()
+      : new Date(cur.startedAt).getTime() + (cur.durationMs ?? 0)
+    const nextStartedAtMs = new Date(next.startedAt).getTime()
+
+    segments.push({
+      fromInteractionId: cur.interactionId,
+      toInteractionId: next.interactionId,
+      durationMs: Math.max(0, nextStartedAtMs - endedAtMs),
+      actions,
+    })
+  }
+  return segments
+}
+
+interface CodexToolCall {
+  callId: string
+  name: string
+  input: unknown
+}
+
+function extractToolCallFromOutput(item: ResponsesOutputItem): CodexToolCall | null {
+  if (item.type === 'function_call') {
+    const f = item as ResponsesFunctionCallItem
+    // arguments is a raw JSON string; parse opportunistically. If parse
+    // fails (incomplete during a live stream, custom serialiser, …)
+    // surface the raw string — better than dropping the call entirely.
+    let parsed: unknown = f.arguments
+    if (typeof f.arguments === 'string') {
+      try {
+        parsed = JSON.parse(f.arguments)
+      } catch {
+        parsed = f.arguments
+      }
+    }
+    return { callId: f.call_id, name: f.name, input: parsed }
+  }
+  if (item.type === 'custom_tool_call') {
+    const c = item as ResponsesCustomToolCallItem
+    return { callId: c.call_id, name: c.name, input: c.input }
+  }
+  if (item.type === 'local_shell_call') {
+    const l = item as ResponsesLocalShellCallItem
+    const id = l.call_id ?? l.id
+    if (!id) return null
+    return { callId: id, name: 'local_shell', input: l.action }
+  }
+  if (item.type === 'web_search_call') {
+    const w = item as ResponsesWebSearchCallItem
+    const id = (w as { call_id?: string }).call_id ?? w.id
+    if (!id) return null
+    return { callId: id, name: 'web_search', input: w.action ?? null }
+  }
+  if (item.type === 'image_generation_call') {
+    const ig = item as ResponsesImageGenerationCallItem
+    const id = (ig as { call_id?: string }).call_id ?? ig.id
+    if (!id) return null
+    return {
+      callId: id,
+      name: 'image_generation',
+      input: { revised_prompt: ig.revised_prompt, status: ig.status },
+    }
+  }
+  if (item.type === 'tool_search_call') {
+    const ts = item as ResponsesToolSearchCallItem
+    const id = ts.call_id ?? ts.id
+    if (!id) return null
+    return { callId: id, name: 'tool_search', input: ts.arguments }
+  }
+  return null
+}
+
+interface ResolvedOutput {
+  callId: string
+  text: string
+  chars: number
+  isError: boolean
+  hasImage: boolean
+}
+
+function extractToolResultFromInput(item: ResponsesInputItem): ResolvedOutput | null {
+  if (item.type === 'function_call_output') {
+    return resolveOutputPayload(item.call_id, item.output)
+  }
+  if (item.type === 'custom_tool_call_output') {
+    return resolveOutputPayload(item.call_id, item.output)
+  }
+  if (item.type === 'mcp_tool_call_output') {
+    const out = (item as { output: unknown }).output
+    if (typeof out === 'string') return resolveOutputPayload(item.call_id, out)
+    if (Array.isArray(out)) {
+      return resolveOutputPayload(item.call_id, out as FunctionCallOutputPayload)
+    }
+    const str = safeStringify(out)
+    return { callId: item.call_id, text: str, chars: str.length, isError: false, hasImage: false }
+  }
+  return null
+}
+
+function resolveOutputPayload(
+  callId: string,
+  payload: FunctionCallOutputPayload,
+): ResolvedOutput {
+  if (typeof payload === 'string') {
+    // Codex's `shell` tool returns a JSON-stringified envelope:
+    //   { output: "<combined stdout/stderr>",
+    //     metadata: { exit_code, duration_seconds } }
+    // Surface the inner `output` so the preview shows what the user
+    // actually wants to see; flag non-zero exit codes as errors.
+    let text = payload
+    let isError = false
+    if (looksLikeShellEnvelope(payload)) {
+      try {
+        const obj = JSON.parse(payload) as {
+          output?: unknown
+          metadata?: { exit_code?: number }
+        }
+        if (typeof obj.output === 'string') {
+          text = obj.output
+          if (
+            obj.metadata?.exit_code != null &&
+            obj.metadata.exit_code !== 0
+          ) {
+            isError = true
+          }
+        }
+      } catch {
+        // not actually JSON — keep raw text
+      }
+    }
+    return { callId, text, chars: text.length, isError, hasImage: false }
+  }
+  let text = ''
+  let chars = 0
+  let hasImage = false
+  for (const block of payload) {
+    if (block.type === 'input_text') {
+      text += block.text + '\n'
+      chars += block.text.length
+    } else if (block.type === 'input_image') {
+      hasImage = true
+    }
+  }
+  return { callId, text, chars, isError: false, hasImage }
+}
+
+// Cheap probe before JSON.parse — most function_call_output strings are
+// freeform tool output and we'd rather not pay the parse cost just to
+// discover that.
+function looksLikeShellEnvelope(s: string): boolean {
+  const t = s.trimStart()
+  return t.startsWith('{') && t.includes('"output"') && t.includes('"metadata"')
+}
+
+function safeStringify(v: unknown): string {
+  try {
+    return typeof v === 'string' ? v : JSON.stringify(v, null, 2)
+  } catch {
+    return String(v)
+  }
 }

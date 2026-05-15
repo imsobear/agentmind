@@ -159,6 +159,50 @@ export async function start(opts: StartOpts): Promise<http.Server> {
       }
     })
   })
+
+  // WebSocket upgrade handler. Node routes `Upgrade: websocket` requests
+  // to the `upgrade` event, NOT to the normal request handler — so without
+  // this listener, Codex CLI's default WS attempt against
+  // `ws://127.0.0.1:<port>/v1/responses` just hangs and consumes the full
+  // stream_max_retries × 15s timeout budget (~75s) before falling back to
+  // HTTP. Most users give up long before that and report "AgentMind
+  // captured nothing". We respond with HTTP 426 + a one-line hint so the
+  // failure mode is loud and actionable; Codex sees the non-101 response
+  // and bails immediately, falling through to HTTP/SSE only if the user
+  // has configured `supports_websockets = false` in their Codex provider
+  // (we recommend that in the hint).
+  server.on('upgrade', (req, socket) => {
+    const ts = new Date().toISOString().slice(11, 23)
+    const urlPath = (req.url ?? '').split('?')[0]
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[agentmind ${ts}] WebSocket upgrade to ${urlPath} — refusing.\n` +
+        `  AgentMind only speaks HTTP/SSE. Codex CLI tries WS first and won't\n` +
+        `  fall back until 5×15s retries elapse. The fix is one of:\n\n` +
+        `    A. Use the launcher (handles everything):\n` +
+        `         agentmind-cli codex\n\n` +
+        `    B. Add this provider block to ~/.codex/config.toml:\n` +
+        `         model_provider = "agentmind"\n` +
+        `         [model_providers.agentmind]\n` +
+        `         base_url = "http://${host}:${opts.port}/v1"\n` +
+        `         requires_openai_auth = true   # use cached codex login\n` +
+        `         wire_api = "responses"\n` +
+        `         supports_websockets = false\n`,
+    )
+    const body =
+      'AgentMind speaks HTTP/SSE, not WebSocket.\n' +
+      'Set `supports_websockets = false` on your Codex provider config.\n'
+    socket.write(
+      'HTTP/1.1 426 Upgrade Required\r\n' +
+        'Content-Type: text/plain; charset=utf-8\r\n' +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        'Connection: close\r\n' +
+        '\r\n' +
+        body,
+    )
+    socket.destroy()
+  })
+
   await new Promise<void>((resolveListen, rejectListen) => {
     server.once('error', rejectListen)
     server.listen(opts.port, host, () => {

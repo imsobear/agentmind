@@ -263,12 +263,17 @@ export function createCaptureMiddleware() {
   ): Promise<void> {
     const urlPath = (req.url ?? '').split('?')[0]
 
-    // Log every /v1/* and /api/* hit so misrouted claude requests are visible.
+    // Log every /v1/* and /api/* hit so misrouted agent requests are visible.
     if (urlPath.startsWith('/v1/') || urlPath.startsWith('/api/')) {
       logReq(req.method ?? '?', urlPath)
     }
 
     // Proxy endpoints — one per protocol adapter.
+    //
+    // WebSocket upgrade attempts (Codex CLI defaults to WS for the Responses
+    // API) never reach this handler — Node routes them to the http.Server's
+    // `upgrade` event instead. See prod-entry.ts for the WS-refusal handler;
+    // it tells Codex users how to disable WS in their config.
     const protocolProxy = protocolProxies.get(urlPath)
     if (protocolProxy && adapterForPath(urlPath)) {
       try {
@@ -282,6 +287,27 @@ export function createCaptureMiddleware() {
           } catch {}
         }
       }
+      return
+    }
+
+    // Anything that came in on POST /v1/* but didn't match a known adapter
+    // is almost certainly a typo or a path the agent uses that we don't
+    // know about yet (e.g. /v1/responses?xyz, /v1/chat/completions). Log a
+    // clearer warning so the user can see WHY their traffic isn't being
+    // captured.
+    if (urlPath.startsWith('/v1/') && req.method === 'POST') {
+      const ts = new Date().toISOString().slice(11, 23)
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[proxy ${ts}] POST ${urlPath} — no adapter for this path. ` +
+          `Known: ${adapters.map((a) => a.endpointPath).join(', ')}`,
+      )
+      sendJson(res, 404, {
+        error: 'no_protocol_adapter',
+        message: `No AgentMind adapter for path ${urlPath}. Known: ${adapters
+          .map((a) => a.endpointPath)
+          .join(', ')}`,
+      })
       return
     }
 

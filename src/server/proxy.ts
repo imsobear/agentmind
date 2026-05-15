@@ -18,76 +18,113 @@ import type { ProtocolAdapter } from './adapters'
 
 const PROXY_VERSION = '0.2.0'
 
-// Per-adapter upstream base URL. Order of precedence:
-//   1. agent-specific env override (AGENTMIND_UPSTREAM_<AGENT>)
-//   2. legacy AGENTMIND_UPSTREAM (Anthropic only, kept for back-compat)
-//   3. hardcoded default
-function upstreamBase(adapter: ProtocolAdapter): string {
-  if (adapter.agentType === 'claude-code') {
-    return (
-      process.env.AGENTMIND_UPSTREAM_ANTHROPIC ||
-      process.env.AGENTMIND_UPSTREAM ||
-      'https://api.anthropic.com'
-    )
-  }
-  if (adapter.agentType === 'codex-cli') {
-    return process.env.AGENTMIND_UPSTREAM_OPENAI || 'https://api.openai.com'
-  }
-  return 'https://api.anthropic.com'
-}
-
-// Headers we forward as-is to upstream. Deliberately NOT forwarded:
-//   • host / connection / content-length → recomputed by undici
-//   • accept-encoding → we want plaintext from upstream so our SSE tee can
-//     pass bytes straight through to the agent.
+// Headers we explicitly DO NOT forward. Everything else passes through.
 //
-// Union of headers both Anthropic and OpenAI clients send. We're permissive
-// — anything not on this list never reaches upstream, which is fine for
-// the headers that exist purely to drive the local CLI's behavior.
-const FORWARD_HEADERS = new Set([
-  // Anthropic
-  'x-api-key',
-  'anthropic-version',
-  'anthropic-beta',
-  'anthropic-dangerous-direct-browser-access',
-  // OpenAI
-  'openai-organization',
-  'openai-project',
-  'openai-beta',
-  // Shared
-  'authorization',
-  'content-type',
-  'user-agent',
-  'accept',
-  // Codex CLI session/thread plumbing — pass through so backend
-  // correlates retries / sub-requests.
-  'session-id',
-  'thread-id',
-  'x-client-request-id',
-  'x-openai-subagent',
-  // x-stainless-* — Anthropic and OpenAI both use these for telemetry
-  // disambiguation; forward verbatim so server-side metrics aren't
-  // mis-attributed to "agentmind proxy".
-  'x-stainless-arch',
-  'x-stainless-lang',
-  'x-stainless-os',
-  'x-stainless-package-version',
-  'x-stainless-retry-count',
-  'x-stainless-runtime',
-  'x-stainless-runtime-version',
-  'x-stainless-timeout',
-  'x-app',
+// Switched from allow-list to deny-list because chatgpt.com /
+// backend-api/codex is more particular than api.openai.com — it
+// expects whatever Codex CLI's default reqwest client sends
+// (`originator`, residency, Cloudflare cookies, ...) and a tight
+// allow-list silently drops headers that turn out to matter. Proxy
+// duty is to relay; clients sending malformed/sensitive headers is
+// their problem, not ours. We DO still redact `authorization` and
+// `x-api-key` in the persisted record (see `safeRequestHeaders`).
+const NON_FORWARDED_HEADERS = new Set([
+  'host', // we recompute per upstream
+  'connection',
+  'content-length', // undici computes
+  'accept-encoding', // want plaintext from upstream for SSE tee
+  'keep-alive',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
 ])
 
 function pickForwardHeaders(incoming: IncomingMessage): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [k, v] of Object.entries(incoming.headers)) {
     if (v == null) continue
-    if (FORWARD_HEADERS.has(k.toLowerCase())) {
-      out[k] = Array.isArray(v) ? v.join(', ') : String(v)
-    }
+    if (NON_FORWARDED_HEADERS.has(k.toLowerCase())) continue
+    out[k] = Array.isArray(v) ? v.join(', ') : String(v)
   }
   return out
+}
+
+// Pick the upstream URL + Host header per request.
+//
+// Anthropic is uniform — there's just one endpoint regardless of auth
+// flavor (api key vs OAuth via `claude login`), so a single base URL +
+// adapter.endpointPath is enough.
+//
+// Codex CLI is bimodal:
+//   - API-key auth     → `Authorization: Bearer sk-...`     → api.openai.com/v1/responses
+//   - ChatGPT OAuth    → `Authorization: Bearer eyJ...`     → chatgpt.com/backend-api/codex/responses
+// The Responses API schema is identical on both endpoints, only the
+// host + path prefix change. We sniff the token shape on each request
+// (it's stable: API keys are `sk-…`, OAuth access tokens are JWTs that
+// start with `eyJ`) and route accordingly. Falls back to API-key
+// behavior for unknown / missing tokens — keeps the existing smoke
+// test (which sends no auth header) working unchanged.
+//
+// Both routes are env-overridable for local testing.
+interface UpstreamTarget {
+  url: string
+  host: string
+  isChatGptBackend: boolean
+}
+
+function resolveUpstream(
+  adapter: ProtocolAdapter,
+  forwardedHeaders: Record<string, string>,
+): UpstreamTarget {
+  if (adapter.agentType === 'claude-code') {
+    const base =
+      process.env.AGENTMIND_UPSTREAM_ANTHROPIC ||
+      process.env.AGENTMIND_UPSTREAM ||
+      'https://api.anthropic.com'
+    const url = `${base}${adapter.endpointPath}`
+    return { url, host: new URL(base).host, isChatGptBackend: false }
+  }
+
+  if (adapter.agentType === 'codex-cli') {
+    if (isChatGptOAuthToken(forwardedHeaders)) {
+      const base =
+        process.env.AGENTMIND_UPSTREAM_OPENAI_CHATGPT ||
+        'https://chatgpt.com/backend-api/codex'
+      const url = `${base}/responses`
+      return { url, host: new URL(base).host, isChatGptBackend: true }
+    }
+    const base = process.env.AGENTMIND_UPSTREAM_OPENAI || 'https://api.openai.com'
+    const url = `${base}${adapter.endpointPath}`
+    return { url, host: new URL(base).host, isChatGptBackend: false }
+  }
+
+  // Unknown adapter — degrade to Anthropic-shaped default.
+  return {
+    url: `https://api.anthropic.com${adapter.endpointPath}`,
+    host: 'api.anthropic.com',
+    isChatGptBackend: false,
+  }
+}
+
+// True iff the Authorization header carries a ChatGPT-style OAuth /
+// id_token instead of a `sk-…` platform API key. OAuth tokens are
+// JWTs, which always start with `eyJ` after base64 url-encoding the
+// `{"alg":...}` header object. We tolerate the `Bearer ` prefix being
+// missing (some clients omit it) and case-insensitive header lookup.
+function isChatGptOAuthToken(headers: Record<string, string>): boolean {
+  let value: string | undefined
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === 'authorization') {
+      value = v
+      break
+    }
+  }
+  if (!value) return false
+  const trimmed = value.replace(/^Bearer\s+/i, '').trim()
+  if (!trimmed) return false
+  return trimmed.startsWith('eyJ')
 }
 
 function safeRequestHeaders(headers: Record<string, string>): Record<string, string> {
@@ -202,13 +239,12 @@ export function createProtocolProxy(adapter: ProtocolAdapter, deps: ProxyDeps) {
     // 4. Forward upstream.
     let upstream
     try {
-      const base = upstreamBase(adapter)
-      const upstreamHost = new URL(base).host
-      upstream = await undiciRequest(`${base}${adapter.endpointPath}`, {
+      const target = resolveUpstream(adapter, forwardHeaders)
+      upstream = await undiciRequest(target.url, {
         method: 'POST',
         headers: {
           ...forwardHeaders,
-          host: upstreamHost,
+          host: target.host,
           'accept-encoding': 'identity',
         },
         body: bodyBuf,

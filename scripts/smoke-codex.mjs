@@ -17,6 +17,7 @@
 import { spawn } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import * as http from 'node:http'
+import * as net from 'node:net'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -27,6 +28,7 @@ const repo = resolve(here, '..')
 
 const UPSTREAM_PORT = 18290
 const PROXY_PORT = 18291
+const CHATGPT_UPSTREAM_PORT = 18294
 const FAKE_CWD = '/private/var/codex-smoke/' + Math.random().toString(36).slice(2, 8)
 const dataDir = mkdtempSync(join(tmpdir(), 'agentmind-codex-smoke-'))
 
@@ -35,20 +37,76 @@ function log(...a) {
 }
 
 // 1. Stub upstream — mirrors POST /v1/responses with a canned stream.
+//    Important: this stub matches the REAL wire shape Codex/ChatGPT
+//    actually emit, which is *more sparse* than the OpenAI docs:
+//      * events do NOT carry `output_index` (only `item_id`)
+//      * `response.completed` does NOT carry `output[]` — only the
+//        envelope metadata (`id`, `usage`, `status`). The actual
+//        output is the union of preceding `output_item.done` events.
+//    If you reintroduce `output_index` or a populated
+//    `response.completed.output` you'll mask the accumulator bugs this
+//    file was written to catch.
+//
+// Behaviour branches on whether the incoming request contains any
+// `function_call_output` in `input[]`:
+//   - First turn (no tool result yet) → emit [message, function_call]
+//     so the agent must execute a tool and come back with the output.
+//   - Second turn (carries the result) → emit a final [message] with no
+//     more tool calls, so action segment computation has a complete
+//     iter1 → iter2 pair to render.
 const upstream = http.createServer((req, res) => {
   if (req.method !== 'POST' || req.url !== '/v1/responses') {
     res.statusCode = 404
     res.end()
     return
   }
-  // Drain body (we don't validate it here — the proxy already did).
   const chunks = []
   req.on('data', (c) => chunks.push(c))
   req.on('end', async () => {
+    let isFollowUp = false
+    try {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      isFollowUp = Array.isArray(body.input)
+        && body.input.some((i) => i && i.type === 'function_call_output')
+    } catch {}
     res.statusCode = 200
     res.setHeader('content-type', 'text/event-stream')
     res.setHeader('cache-control', 'no-cache')
     const write = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    if (isFollowUp) {
+      write({
+        type: 'response.created',
+        response: { id: 'resp_smoke_2', model: 'gpt-5-codex', status: 'in_progress' },
+      })
+      await delay(10)
+      write({
+        type: 'response.output_item.added',
+        item: { type: 'message', id: 'msg_smoke_2', role: 'assistant', content: [] },
+      })
+      write({ type: 'response.output_text.delta', item_id: 'msg_smoke_2', delta: 'Done. ' })
+      write({ type: 'response.output_text.delta', item_id: 'msg_smoke_2', delta: 'Bye.' })
+      write({
+        type: 'response.output_item.done',
+        item: {
+          type: 'message',
+          id: 'msg_smoke_2',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Done. Bye.' }],
+        },
+      })
+      write({
+        type: 'response.completed',
+        response: {
+          id: 'resp_smoke_2',
+          object: 'response',
+          model: 'gpt-5-codex',
+          status: 'completed',
+          usage: { input_tokens: 50, output_tokens: 3, total_tokens: 53 },
+        },
+      })
+      res.end()
+      return
+    }
     write({
       type: 'response.created',
       response: { id: 'resp_smoke_1', model: 'gpt-5-codex', status: 'in_progress' },
@@ -56,15 +114,13 @@ const upstream = http.createServer((req, res) => {
     await delay(20)
     write({
       type: 'response.output_item.added',
-      output_index: 0,
       item: { type: 'message', id: 'msg_smoke_1', role: 'assistant', content: [] },
     })
-    write({ type: 'response.output_text.delta', output_index: 0, delta: 'Hello ' })
-    write({ type: 'response.output_text.delta', output_index: 0, delta: 'from Codex.' })
+    write({ type: 'response.output_text.delta', item_id: 'msg_smoke_1', delta: 'Hello ' })
+    write({ type: 'response.output_text.delta', item_id: 'msg_smoke_1', delta: 'from Codex.' })
     await delay(10)
     write({
       type: 'response.output_item.done',
-      output_index: 0,
       item: {
         type: 'message',
         id: 'msg_smoke_1',
@@ -74,7 +130,6 @@ const upstream = http.createServer((req, res) => {
     })
     write({
       type: 'response.output_item.added',
-      output_index: 1,
       item: {
         type: 'function_call',
         id: 'fc_smoke_1',
@@ -85,17 +140,16 @@ const upstream = http.createServer((req, res) => {
     })
     write({
       type: 'response.function_call_arguments.delta',
-      output_index: 1,
+      item_id: 'fc_smoke_1',
       delta: '{"command":["echo",',
     })
     write({
       type: 'response.function_call_arguments.delta',
-      output_index: 1,
+      item_id: 'fc_smoke_1',
       delta: '"hi"]}',
     })
     write({
       type: 'response.output_item.done',
-      output_index: 1,
       item: {
         type: 'function_call',
         id: 'fc_smoke_1',
@@ -111,21 +165,9 @@ const upstream = http.createServer((req, res) => {
         object: 'response',
         model: 'gpt-5-codex',
         status: 'completed',
-        output: [
-          {
-            type: 'message',
-            id: 'msg_smoke_1',
-            role: 'assistant',
-            content: [{ type: 'output_text', text: 'Hello from Codex.' }],
-          },
-          {
-            type: 'function_call',
-            id: 'fc_smoke_1',
-            call_id: 'call_smoke_1',
-            name: 'shell',
-            arguments: '{"command":["echo","hi"]}',
-          },
-        ],
+        // Deliberately no `output` field — matches chatgpt.com/
+        // backend-api/codex and forces the accumulator to materialise
+        // output from the preceding `output_item.done` events.
         usage: { input_tokens: 42, output_tokens: 7, total_tokens: 49 },
       },
     })
@@ -135,7 +177,55 @@ const upstream = http.createServer((req, res) => {
 await new Promise((r) => upstream.listen(UPSTREAM_PORT, '127.0.0.1', r))
 log('upstream stub listening on', UPSTREAM_PORT)
 
-// 2. Boot agentmind-cli pointed at the stub.
+// 1b. Second stub pretending to be chatgpt.com/backend-api/codex —
+//     this is where Codex CLI's ChatGPT-OAuth traffic gets routed
+//     when the proxy sees a JWT-shaped bearer token. The path
+//     differs (`/responses` instead of `/v1/responses`) — that's
+//     exactly the routing decision we're trying to verify.
+let chatGptHits = 0
+const chatGptStub = http.createServer((req, res) => {
+  if (req.method !== 'POST' || req.url !== '/responses') {
+    res.statusCode = 404
+    res.end()
+    return
+  }
+  chatGptHits++
+  // Drain body and reply with a minimal completed-response SSE.
+  req.on('data', () => {})
+  req.on('end', async () => {
+    res.statusCode = 200
+    res.setHeader('content-type', 'text/event-stream')
+    const write = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    write({
+      type: 'response.created',
+      response: { id: 'resp_chatgpt_1', model: 'gpt-5-codex', status: 'in_progress' },
+    })
+    await delay(10)
+    write({
+      type: 'response.completed',
+      response: {
+        id: 'resp_chatgpt_1',
+        object: 'response',
+        model: 'gpt-5-codex',
+        status: 'completed',
+        output: [
+          {
+            type: 'message',
+            id: 'msg_chatgpt_1',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'hello from chatgpt route' }],
+          },
+        ],
+        usage: { input_tokens: 5, output_tokens: 5, total_tokens: 10 },
+      },
+    })
+    res.end()
+  })
+})
+await new Promise((r) => chatGptStub.listen(CHATGPT_UPSTREAM_PORT, '127.0.0.1', r))
+log('chatgpt-route stub listening on', CHATGPT_UPSTREAM_PORT)
+
+// 2. Boot agentmind-cli pointed at BOTH stubs.
 const cli = spawn(process.execPath, [resolve(repo, 'bin', 'cli.js'),
   '--port', String(PROXY_PORT),
   '--data', dataDir,
@@ -145,6 +235,7 @@ const cli = spawn(process.execPath, [resolve(repo, 'bin', 'cli.js'),
   env: {
     ...process.env,
     AGENTMIND_UPSTREAM_OPENAI: `http://127.0.0.1:${UPSTREAM_PORT}`,
+    AGENTMIND_UPSTREAM_OPENAI_CHATGPT: `http://127.0.0.1:${CHATGPT_UPSTREAM_PORT}`,
     AGENTMIND_VERBOSE: '0',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -284,6 +375,151 @@ log('  agent     =', proj.agentType)
 log('  output    =', resp.output.length, 'items')
 log('  usage     =', JSON.stringify(resp.usage))
 
+// 4c. Action segments — fire a follow-up turn carrying the
+//     `function_call_output` for the iter1 shell call so the aggregator
+//     can pair iter1's tool call with iter2's result and emit one
+//     ActionSegment. This is the "Execute tools" overview the UI
+//     renders between adjacent iteration cards.
+log('action segment (iter1 -> iter2) check...')
+const followUpBody = {
+  ...codexBody,
+  input: [
+    ...codexBody.input,
+    {
+      type: 'function_call_output',
+      call_id: 'call_smoke_1',
+      output: JSON.stringify({
+        output: 'hi\n',
+        metadata: { exit_code: 0, duration_seconds: 0.01 },
+      }),
+    },
+  ],
+}
+const post2 = await streamPost('/v1/responses', followUpBody)
+if (post2.status !== 200) throw new Error('iter2 proxy returned ' + post2.status)
+await delay(150)
+const detail2 = await request('GET', `/api/projects/${proj.projectId}`)
+if (detail2.status !== 200) throw new Error('detail2 status ' + detail2.status)
+const msg = detail2.body.messages[0]
+if (!msg) throw new Error('no aggregated message after iter2')
+if (msg.interactions.length !== 2) {
+  throw new Error('expected 2 interactions after iter2, got ' + msg.interactions.length)
+}
+const segs = msg.actionSegments ?? []
+if (segs.length !== 1) {
+  throw new Error('expected 1 actionSegment, got ' + JSON.stringify(segs))
+}
+const seg = segs[0]
+if (seg.actions.length !== 1) throw new Error('expected 1 action in segment')
+const action = seg.actions[0]
+if (action.toolUseId !== 'call_smoke_1') throw new Error('toolUseId mismatch: ' + action.toolUseId)
+if (action.name !== 'shell') throw new Error('action.name mismatch: ' + action.name)
+// Shell envelope unwrapping — preview should be the inner `output`,
+// not the JSON-stringified wrapper.
+if (action.resultPreview !== 'hi\n') {
+  throw new Error('expected resultPreview="hi\\n", got: ' + JSON.stringify(action.resultPreview))
+}
+if (action.isError) throw new Error('exit_code=0 should not mark error')
+if (seg.pending) throw new Error('segment must not be pending — iter2 captured')
+log('OK — action segment paired iter1 function_call -> iter2 function_call_output')
+log('  action    = shell -> "hi"')
+
+// 4a. ChatGPT-OAuth routing. When the incoming Authorization header
+//     carries a JWT-shaped bearer (real users get this from
+//     `codex login`), the proxy must route to the chatgpt.com path
+//     instead of api.openai.com. We send a request with a fake JWT
+//     and verify it lands on the chatgpt stub, not the openai one.
+log('OAuth (JWT) -> chatgpt.com routing check...')
+const openaiHitsBefore = 0 // not tracked; we use chatGptHits delta to assert
+const chatGptHitsBefore = chatGptHits
+const FAKE_JWT_CWD = '/private/var/codex-oauth-smoke/' + Math.random().toString(36).slice(2, 8)
+const oauthRes = await fetch(`http://127.0.0.1:${PROXY_PORT}/v1/responses`, {
+  method: 'POST',
+  headers: {
+    'content-type': 'application/json',
+    // `eyJ…` is a valid JWT header prefix (`{` base64-encoded). The
+    // proxy uses ONLY this prefix to disambiguate from `sk-…`.
+    authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.fakeBody.fakeSig',
+  },
+  body: JSON.stringify({
+    ...codexBody,
+    // Different cwd so this lands in a fresh project we can spot.
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text:
+              '<environment_context>\n' +
+              `  <cwd>${FAKE_JWT_CWD}</cwd>\n` +
+              '  <shell>zsh</shell>\n' +
+              '</environment_context>',
+          },
+        ],
+      },
+    ],
+  }),
+})
+// Drain.
+const _oauthReader = oauthRes.body.getReader()
+while (true) {
+  const { done } = await _oauthReader.read()
+  if (done) break
+}
+await delay(100)
+if (oauthRes.status !== 200) throw new Error('OAuth path returned ' + oauthRes.status)
+if (chatGptHits !== chatGptHitsBefore + 1) {
+  throw new Error(
+    `OAuth routing wrong: chatgpt stub hits ${chatGptHitsBefore} -> ${chatGptHits} (want +1)`,
+  )
+}
+const listAfterOAuth = await request('GET', '/api/projects')
+const oauthProj = listAfterOAuth.body.find((p) => p.cwd === FAKE_JWT_CWD)
+if (!oauthProj) throw new Error('OAuth-route project not captured')
+log('OK — OAuth (JWT) routed to chatgpt.com path; project captured:')
+log('  cwd =', oauthProj.cwd)
+
+// 4b. WebSocket upgrade must be refused with 426 + a hint body. Codex
+//     CLI defaults to WS transport for the Responses API; without this
+//     rejection the agent stalls for ~75s before falling back to HTTP
+//     and the user thinks AgentMind is broken. We send a raw handshake
+//     on a fresh socket and assert the response.
+log('WS upgrade rejection check...')
+await new Promise((resolve, reject) => {
+  const sock = net.createConnection({ host: '127.0.0.1', port: PROXY_PORT }, () => {
+    sock.write(
+      'GET /v1/responses HTTP/1.1\r\n' +
+        `Host: 127.0.0.1:${PROXY_PORT}\r\n` +
+        'Upgrade: websocket\r\n' +
+        'Connection: Upgrade\r\n' +
+        'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+        'Sec-WebSocket-Version: 13\r\n' +
+        '\r\n',
+    )
+  })
+  const chunks = []
+  sock.on('data', (c) => chunks.push(c))
+  sock.on('end', () => {
+    const text = Buffer.concat(chunks).toString('utf8')
+    if (!text.startsWith('HTTP/1.1 426')) {
+      reject(new Error('expected 426 Upgrade Required, got: ' + text.slice(0, 80)))
+      return
+    }
+    if (!text.toLowerCase().includes('supports_websockets')) {
+      reject(new Error('WS refusal body missing hint about supports_websockets'))
+      return
+    }
+    log('  WS upgrade -> 426 Upgrade Required (with config hint)')
+    resolve()
+  })
+  sock.on('error', reject)
+  sock.setTimeout(5000, () => {
+    sock.destroy(new Error('WS check timed out'))
+  })
+})
+
 // 5. Regression: same proxy must still capture Anthropic Messages
 // traffic correctly. We swap the upstream to mimic api.anthropic.com
 // and fire a streaming /v1/messages request with a cwd embedded in
@@ -363,8 +599,9 @@ if (!anthropicPost.sse.includes('message_stop')) throw new Error('SSE missing me
 
 await delay(150)
 const list2 = await request('GET', '/api/projects')
-if (list2.body.length !== 2) {
-  throw new Error('expected 2 projects after anthropic call, got ' + list2.body.length)
+// 3 projects expected: codex-apikey path + codex-oauth path + anthropic.
+if (list2.body.length !== 3) {
+  throw new Error('expected 3 projects after anthropic call, got ' + list2.body.length)
 }
 const anthropicProj = list2.body.find((p) => p.agentType === 'claude-code')
 if (!anthropicProj) throw new Error('claude-code project not found')
@@ -376,6 +613,7 @@ log('  agent     =', anthropicProj.agentType)
 
 cli2.kill('SIGINT')
 upstream.close()
+chatGptStub.close()
 anthropicUpstream.close()
 await delay(50)
 rmSync(dataDir, { recursive: true, force: true })

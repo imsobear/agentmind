@@ -47,48 +47,66 @@ Use it to:
 ## Quick start
 
 ```bash
-# 1. Run AgentMind (terminal A)
-npx agentmind-cli        # listens on http://127.0.0.1:8088 and opens browser
+npm install -g agentmind-cli
 
-# 2. Point your agent at it (terminal B)
-
-# Claude Code (Anthropic Messages API)
-ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
-
-# …or Codex CLI (OpenAI Responses API)
-OPENAI_BASE_URL=http://127.0.0.1:8088/v1 codex
+# Launch your agent through AgentMind — one command, zero config,
+# no API keys required.
+agentmind-cli claude           # or: agentmind-cli claude "fix the build"
+agentmind-cli codex            # or: agentmind-cli codex exec "ship the PR"
 ```
 
-That's it. Every prompt you type in terminal B shows up in the browser as a
-new row — live, while the agent is still streaming. No build step, no DB, no
-sign-up.
+That's it. AgentMind boots the dashboard, opens it in your browser,
+injects the right env / config so your agent talks to the proxy, and
+hands the terminal off to the agent's TUI. Every prompt you type shows
+up in the dashboard as a new project — live, while the agent is still
+streaming. When the agent exits the dashboard keeps running so you can
+browse the captured trace. Hit Ctrl+C to stop AgentMind.
+
+> Both agents work with their **existing logins** — `claude login` for
+> Claude Code, `codex login` for Codex CLI. No API key wrangling. The
+> proxy sniffs the auth flavor (ChatGPT OAuth vs `sk-…`) and forwards
+> to the correct upstream automatically.
+
+> Anything after the subcommand is forwarded verbatim to the agent, so
+> wrappers like `agentmind-cli codex --model gpt-5 --resume` just work.
+
+Prefer `npx`?
+
+```bash
+npx agentmind-cli codex
+```
+
+### Just want the dashboard?
+
+```bash
+agentmind-cli                  # dashboard on http://127.0.0.1:8088
+agentmind-cli --port 9090      # custom port
+agentmind-cli --no-open        # don't auto-open the browser
+```
+
+Then start your agent yourself — see [Manual setup](#manual-setup) below.
 
 **Supported agents** (v0.2):
 
-| Agent      | Upstream                | Proxy endpoint we capture |
-| ---------- | ----------------------- | ------------------------- |
-| Claude Code| `api.anthropic.com`     | `POST /v1/messages`       |
-| Codex CLI  | `api.openai.com`        | `POST /v1/responses`      |
+| Agent      | Upstream                | Proxy endpoint we capture | Launcher           |
+| ---------- | ----------------------- | ------------------------- | ------------------ |
+| Claude Code| `api.anthropic.com`     | `POST /v1/messages`       | `agentmind-cli claude` |
+| Codex CLI  | `api.openai.com`        | `POST /v1/responses`      | `agentmind-cli codex`  |
 
 Both agents land in the same cwd-keyed project (so if you switch between
 them in one directory, you see both threads against the same workspace).
 The sidebar tags non-default agents with a small `codex` chip so a mixed
 inbox stays scannable.
 
-Install globally if you'd rather not type `npx`:
-
-```bash
-npm install -g agentmind-cli
-agentmind-cli --help
-```
-
-Flags:
+Flags (must come BEFORE the subcommand):
 
 | Flag             | Default       | Notes                                      |
 | ---------------- | ------------- | ------------------------------------------ |
-| `--port <n>`     | `8088`        | Listen port (and the proxy URL claude uses) |
+| `--port <n>`     | `8088`        | Listen port (and the URL we hand the agent) |
 | `--data <dir>`   | `~/.agentmind` | Where the JSONL projects live              |
 | `--no-open`      | _off_         | Skip the auto-open browser step            |
+
+Run `agentmind-cli --help` for the full reference.
 
 ## The three panes
 
@@ -157,15 +175,81 @@ share a JSONL with a teammate without leaking your key.
 
 | Agent                            | Status                                |
 | -------------------------------- | ------------------------------------- |
-| Claude Code                      | First-class, fully tested             |
-| Claude SDK / API direct callers  | Works — set `ANTHROPIC_BASE_URL`      |
-| Codex CLI                        | First-class (v0.2+) — set `OPENAI_BASE_URL` |
+| Claude Code                      | First-class, fully tested — `agentmind-cli claude` |
+| Claude SDK / API direct callers  | Works — see [Manual setup](#manual-setup) |
+| Codex CLI                        | First-class (v0.2+) — `agentmind-cli codex` |
 | OpenCode                         | Roadmap                               |
 | Codex Desktop / Claude Desktop   | Not yet (no documented proxy hook)    |
 
-Anything that respects `ANTHROPIC_BASE_URL` (Anthropic Messages API) or
-`OPENAI_BASE_URL` (OpenAI Responses API) is captured today. Adding a
-third protocol is one `ProtocolAdapter` away — see `src/server/adapters.ts`.
+Anything that speaks the Anthropic Messages API (`POST /v1/messages`)
+or the OpenAI Responses API (`POST /v1/responses`) is captured today.
+Adding a third protocol is one `ProtocolAdapter` away — see
+`src/server/adapters.ts`.
+
+## Manual setup
+
+You don't have to use the launchers — `agentmind-cli` (no subcommand)
+just runs the dashboard, and you can point any agent at it yourself.
+
+### Claude Code
+
+Set one env var:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
+```
+
+### Codex CLI
+
+Codex needs an explicit provider entry because two defaults work
+against us:
+
+1. **`OPENAI_BASE_URL` alone is not enough.** Codex CLI v0.118+ defaults
+   to ChatGPT OAuth login. That auth flow ignores the env var and
+   routes through `chatgpt.com/backend-api/codex/`. The fix is
+   `requires_openai_auth = true`, which keeps Codex's normal auth
+   selection (cached ChatGPT login *or* `OPENAI_API_KEY`) but forces
+   the request through our `base_url`.
+2. **WebSocket transport is preferred.** Codex tries `wss://…/responses`
+   first and only falls back to HTTP/SSE after a 5×15s retry budget
+   (~75s). AgentMind only speaks HTTP/SSE, so `supports_websockets =
+   false` is required.
+
+Easiest is one-shot `-c` overrides — same recipe `agentmind-cli codex`
+uses internally:
+
+```bash
+codex \
+  -c 'model_provider="agentmind"' \
+  -c 'model_providers.agentmind.base_url="http://127.0.0.1:8088/v1"' \
+  -c 'model_providers.agentmind.requires_openai_auth=true' \
+  -c 'model_providers.agentmind.wire_api="responses"' \
+  -c 'model_providers.agentmind.supports_websockets=false'
+```
+
+Or persist the provider in `~/.codex/config.toml`:
+
+```toml
+model_provider = "agentmind"
+
+[model_providers.agentmind]
+name = "AgentMind"
+base_url = "http://127.0.0.1:8088/v1"
+requires_openai_auth = true
+wire_api = "responses"
+supports_websockets = false
+```
+
+No API key wrangling either way — Codex sends whichever bearer it
+already has (`codex login` or `OPENAI_API_KEY`), and AgentMind
+dispatches it to the right upstream:
+
+- **`Bearer eyJ…`** (ChatGPT OAuth JWT) → `chatgpt.com/backend-api/codex/responses`
+- **`Bearer sk-…`** (platform API key) → `api.openai.com/v1/responses`
+
+> If you forget `supports_websockets = false`, AgentMind replies `426
+> Upgrade Required` to every WebSocket handshake with a hint pointing
+> back here, so you'll see the problem instantly in the server logs.
 
 ## Tech stack
 
@@ -227,13 +311,14 @@ boots a plain `node:http` server in under 100ms.
 
 Optional env vars (testing/dev only — not user-facing):
 
-| Var                           | Default                       | Effect                                       |
-| ----------------------------- | ----------------------------- | -------------------------------------------- |
-| `AGENTMIND_DATA_DIR`          | `~/.agentmind`                | Override storage directory                   |
-| `AGENTMIND_UPSTREAM_ANTHROPIC`| `https://api.anthropic.com`   | Override Anthropic upstream (test harness)   |
-| `AGENTMIND_UPSTREAM_OPENAI`   | `https://api.openai.com`      | Override OpenAI upstream (Codex test harness)|
-| `AGENTMIND_UPSTREAM`          | _(unset)_                     | Legacy alias for `AGENTMIND_UPSTREAM_ANTHROPIC` |
-| `AGENTMIND_VERBOSE`           | `1`                           | Set to `0` to silence per-request logs       |
+| Var                                  | Default                                  | Effect                                          |
+| ------------------------------------ | ---------------------------------------- | ----------------------------------------------- |
+| `AGENTMIND_DATA_DIR`                 | `~/.agentmind`                           | Override storage directory                      |
+| `AGENTMIND_UPSTREAM_ANTHROPIC`       | `https://api.anthropic.com`              | Override Anthropic upstream (test harness)      |
+| `AGENTMIND_UPSTREAM_OPENAI`          | `https://api.openai.com`                 | Override OpenAI API-key upstream (test harness) |
+| `AGENTMIND_UPSTREAM_OPENAI_CHATGPT`  | `https://chatgpt.com/backend-api/codex`  | Override ChatGPT-OAuth upstream (test harness)  |
+| `AGENTMIND_UPSTREAM`                 | _(unset)_                                | Legacy alias for `AGENTMIND_UPSTREAM_ANTHROPIC` |
+| `AGENTMIND_VERBOSE`                  | `1`                                      | Set to `0` to silence per-request logs          |
 
 ## Roadmap
 

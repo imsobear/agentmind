@@ -90,8 +90,128 @@ goes through these — none of them touch `it.request.messages` or
 Upstream URL precedence (per adapter):
 ```
 claude-code:  AGENTMIND_UPSTREAM_ANTHROPIC > AGENTMIND_UPSTREAM > https://api.anthropic.com
-codex-cli:    AGENTMIND_UPSTREAM_OPENAI                          > https://api.openai.com
+codex-cli (API key, Bearer sk-…):
+              AGENTMIND_UPSTREAM_OPENAI                          > https://api.openai.com
+codex-cli (ChatGPT OAuth, Bearer eyJ…):
+              AGENTMIND_UPSTREAM_OPENAI_CHATGPT                  > https://chatgpt.com/backend-api/codex
 ```
+
+Codex routing is **per-request** based on the Authorization header
+shape, not a startup-time decision. `resolveUpstream` in `proxy.ts`
+inspects `Authorization: Bearer <token>` on each request:
+
+- `eyJ…` prefix → JWT → ChatGPT OAuth flow → chatgpt.com path (`/responses`)
+- `sk-…` or anything else → API key → api.openai.com path (`/v1/responses`)
+
+This matches what `codex-rs/model-provider-info/src/lib.rs`
+(`CHATGPT_CODEX_BASE_URL`) does internally for the built-in `openai`
+provider when `requires_openai_auth = true`. Our launcher sets exactly
+that flag (see `bin/cli.js`), so the user's existing `codex login`
+session works against the proxy with no extra setup. The smoke test
+covers both branches (see `scripts/smoke-codex.mjs`).
+
+Header forwarding is a **deny-list** (`NON_FORWARDED_HEADERS`), not an
+allow-list. ChatGPT's backend is pickier about exotic headers
+(`originator`, `version`, residency, Cloudflare cookies) than
+api.openai.com — fewer surprises if we just relay whatever Codex sent.
+The deny-list is restricted to the hop-by-hop headers undici needs to
+own (`host`, `connection`, `content-length`, `transfer-encoding`, etc.)
+plus `accept-encoding` (we want plaintext for the SSE tee).
+
+### Codex CLI setup quirks (read before debugging "nothing captured")
+
+Pointing Codex CLI at AgentMind is **not** as simple as setting
+`OPENAI_BASE_URL`. Three things work against the obvious approach:
+
+1. **`OPENAI_BASE_URL` is deprecated and only honored on the API-key path.**
+   Codex CLI v0.118+ defaults to ChatGPT OAuth login. That auth flow
+   ignores the env var and routes through `chatgpt.com/backend-api/codex/…`
+   regardless. The fix is a custom provider with
+   `requires_openai_auth = true`, which keeps Codex's normal auth
+   selection but forces the request through *our* `base_url`. Critically,
+   we **do not** want `env_key = "OPENAI_API_KEY"` on the provider — that
+   forces the API-key path and breaks ChatGPT-only users.
+
+2. **WebSocket transport is preferred.** Codex tries
+   `wss://<base_url>/responses` first and only falls back to HTTP/SSE
+   after `stream_max_retries` × 15s timeouts (~75s). AgentMind only
+   speaks HTTP/SSE, so without `supports_websockets = false` users see
+   no traffic until the WS budget exhausts. `prod-entry.ts` listens for
+   the `upgrade` event and replies 426 + a hint body so the failure
+   is loud, but a properly configured provider skips the WS attempt
+   altogether.
+
+3. **The upstream URL must change based on auth flavor.** API-key
+   requests go to `api.openai.com/v1/responses`; ChatGPT-OAuth requests
+   go to `chatgpt.com/backend-api/codex/responses`. Same Responses-API
+   body schema either way, just different hosts and path prefixes. The
+   proxy disambiguates per-request by sniffing the Authorization header
+   (see `resolveUpstream` in `proxy.ts`).
+
+The user-facing fix for all three is `agentmind-cli codex` (see
+[Launcher subcommands](#launcher-subcommands) below), which spawns
+Codex with `-c` overrides that install the right provider for that
+single run only — no `~/.codex/config.toml` mutation, nothing to
+restore on crash. Manual users get a documented `[model_providers.agentmind]`
+recipe in the README.
+
+## Launcher subcommands
+
+`bin/cli.js` accepts two subcommands that take the manual env / config
+dance off the user's plate:
+
+- `agentmind-cli claude [args…]` — boots the dashboard, then `spawn`s
+  `claude` with `ANTHROPIC_BASE_URL` injected. Trivial.
+- `agentmind-cli codex [args…]` — boots the dashboard, then `spawn`s
+  `codex` with these `-c` flags prepended to the user's args:
+  ```
+  -c model_provider="agentmind"
+  -c model_providers.agentmind.name="AgentMind"
+  -c model_providers.agentmind.base_url="<dashboard URL>/v1"
+  -c model_providers.agentmind.requires_openai_auth=true
+  -c model_providers.agentmind.wire_api="responses"
+  -c model_providers.agentmind.supports_websockets=false
+  ```
+  `requires_openai_auth=true` is the key bit — it tells Codex to keep
+  its normal auth selection (cached ChatGPT login *or* `OPENAI_API_KEY`)
+  but route via *our* base_url. We **do not** inject a fake key; the
+  proxy sniffs the bearer token shape per-request and routes either to
+  `api.openai.com/v1/responses` (sk-…) or
+  `chatgpt.com/backend-api/codex/responses` (eyJ…). End result: works
+  with `codex login` alone, no API-key wrangling.
+
+Three things to know if you touch this code:
+
+1. **Stdio handoff.** Children get `stdio: 'inherit'` so their TUI gets
+   the real TTY. AgentMind's own `console.*` / `process.stdout.write`
+   calls would otherwise paint over the TUI, so the launcher
+   monkey-patches them to write to `~/.agentmind/logs/<agent>-<ts>.log`
+   for the duration of the agent run. Method-level redirects don't
+   affect the child because `inherit` dups our underlying fd 1 / fd 2
+   at spawn time.
+
+2. **Signal handling has two phases.** While the agent is running,
+   SIGINT is delivered by the terminal to the whole foreground process
+   group — the child handles its own cleanup, the parent installs a
+   no-op handler so Node doesn't auto-exit. SIGTERM only targets the
+   parent, so we explicitly propagate it to the child. After the child
+   exits, both signals tear the dashboard down cleanly.
+
+3. **Dashboard outlives the agent.** Once the agent exits we print
+   `✓ ${agent} exited. Trace ready at <url>. Press Ctrl+C to stop
+   AgentMind.` and `await new Promise(() => {})` — the dashboard keeps
+   serving so the user can browse the captured trace until they're
+   done. Don't add a "kill on agent exit" shortcut without a flag —
+   we've already weighed that tradeoff and explicit Ctrl+C wins.
+
+The launcher is dashboard-mode aware: it requires `dist/` (i.e. only
+works against the built CLI, not `pnpm dev`). The dev path stays
+manual on purpose — devs hacking on agentmind don't need wrappers.
+
+Smoke coverage: `scripts/smoke-launcher.mjs` shims `codex` and
+`claude` on `PATH` with a node script that records its argv + env,
+then asserts the launcher invoked them with the expected overrides.
+Skipped on Windows (the PATH-shim trick needs `.cmd` plumbing).
 
 ### cwd extraction recipe per agent
 

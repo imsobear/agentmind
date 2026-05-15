@@ -6,16 +6,23 @@
 // `ResponsesObject` once `response.completed` (or `failed`/`incomplete`)
 // arrives.
 //
-// Why a separate parser and not "OpenAI just speaks Anthropic too":
-//   - Event names are different and the deltas target items by
-//     `output_index` / `item_id`, not the linear `index` Anthropic uses.
-//   - Tool args arrive as `function_call_arguments.delta` (string of JSON
-//     fragments) rather than `input_json_delta`.
-//   - There's a `response.completed` envelope that already carries the
-//     fully-assembled `output` array, so for many providers we don't even
-//     need to stitch deltas — we just trust the terminal envelope. We
-//     still stitch as a fallback so anything emitted between item.added
-//     and item.done renders before the envelope arrives.
+// Real wire shape (cross-checked against
+// `codex-rs/codex-api/src/sse/responses.rs`):
+//   - Events DO NOT carry `output_index` at all. Routing is by either
+//     `item_id` (when present) or by the implicit "currently open
+//     item" — the one most recently announced by `output_item.added`
+//     and not yet closed by `output_item.done`. Codex CLI's own
+//     downstream consumer works the same way.
+//   - `response.completed` ships only `{id, usage, status, ...}` —
+//     specifically NOT `output[]`. The output is the union of all
+//     `output_item.done` events that preceded it. If we drop our
+//     running builders when `.completed` arrives, the persisted record
+//     ends up with an empty `output[]` even though the JSON is otherwise
+//     populated.
+//
+// Both of these were silent bugs in v0.2.0: the test stub sent
+// `output_index` (it was synthetic) and a fully populated
+// `response.completed.output`, masking the real-world behavior.
 
 import type {
   ResponsesObject,
@@ -47,12 +54,19 @@ interface ItemBuilder {
 
 export class ResponsesSseAccumulator {
   private buffer = ''
-  // The response envelope as we know it. `response.created` populates the
-  // header (id, model, status="in_progress"), every `output_item.added`
-  // appends a placeholder, deltas mutate that placeholder, and
-  // `response.completed` overwrites everything with the canonical version.
+  // The response envelope as we know it. `response.created` populates
+  // the header (id, model, status="in_progress") and `response.completed`
+  // fills in `usage` + flips the status. We DO NOT trust `.completed` to
+  // bring `output[]` with it — that's stitched separately.
   private envelope: ResponsesObject | null = null
-  private items = new Map<number, ItemBuilder>()
+  // Output items in emission order. Append-only; `output_item.done`
+  // overwrites in place, `response.completed` may overwrite wholesale
+  // (only if it actually carries an output array — rare in practice).
+  private items: ItemBuilder[] = []
+  // Index into `items` of the currently-open builder. Set by
+  // `output_item.added`, cleared by `output_item.done`. Bare deltas
+  // (without `item_id`) target this slot.
+  private openIndex: number | undefined
   events: ResponsesSseEvent[] = []
 
   feed(chunk: string) {
@@ -77,20 +91,16 @@ export class ResponsesSseAccumulator {
   // until `response.created` arrives.
   getResponse(): ResponsesObject | undefined {
     if (!this.envelope) return undefined
-    // Materialise the running item builders into the output array — the
-    // map preserves insertion order via numeric keys we sort by.
-    const indexes = Array.from(this.items.keys()).sort((a, b) => a - b)
-    const output: ResponsesOutputItem[] = []
-    for (const idx of indexes) {
-      const b = this.items.get(idx)
-      if (!b) continue
-      output.push(b.item)
-    }
-    // If `response.completed` has already overwritten `envelope.output`,
-    // prefer that (canonical). Otherwise use the running builders.
+    const fromItems = this.items.map((b) => b.item)
+    // If `response.completed` has already brought a populated output[]
+    // (some upstreams do; chatgpt.com generally does not), prefer that —
+    // it's server-canonical. Otherwise materialise from our running
+    // builders, which are the union of `output_item.done` payloads.
+    const envOutput = this.envelope.output
+    const useEnv = Array.isArray(envOutput) && envOutput.length > 0
     return {
       ...this.envelope,
-      output: this.envelope.output?.length ? this.envelope.output : output,
+      output: useEnv ? envOutput : fromItems,
     }
   }
 
@@ -115,6 +125,21 @@ export class ResponsesSseAccumulator {
     this.handle(parsed)
   }
 
+  // Find the builder a delta targets. Priority order:
+  //   1. `item_id` match against an existing item.id (most precise)
+  //   2. Currently-open slot from the last `output_item.added`
+  // Returns undefined if neither resolves — we silently drop the delta
+  // rather than create a phantom slot.
+  private slotFor(itemId: string | undefined): ItemBuilder | undefined {
+    if (itemId) {
+      for (const b of this.items) {
+        if ((b.item as { id?: string }).id === itemId) return b
+      }
+    }
+    if (this.openIndex != null) return this.items[this.openIndex]
+    return undefined
+  }
+
   private handle(ev: ResponsesSseEvent) {
     const kind = ev.type
     if (kind === 'response.created' || kind === 'response.in_progress') {
@@ -125,10 +150,21 @@ export class ResponsesSseAccumulator {
     if (kind === 'response.completed') {
       const r = (ev as any).response as ResponsesObject | undefined
       if (r) {
-        // Terminal envelope is canonical — drop our running builders, the
-        // server-rendered `output` is what we persist.
-        this.envelope = { ...this.envelope, ...r }
-        this.items.clear()
+        const incomingOutput =
+          Array.isArray(r.output) && r.output.length > 0 ? r.output : undefined
+        this.envelope = {
+          ...(this.envelope ?? blankEnvelope()),
+          ...r,
+          // Critical: if `.completed` lacks output[] (chatgpt.com /
+          // backend-api/codex omits it entirely), DON'T clobber the
+          // running envelope.output we may have inherited. The actual
+          // output lives in our `items` builders, which `getResponse()`
+          // will materialise.
+          output: incomingOutput ?? this.envelope?.output ?? [],
+        }
+        // If the upstream DID ship a canonical output[], it supersedes
+        // anything we stitched — drop the builders to avoid duplicates.
+        if (incomingOutput) this.items = []
       }
       return
     }
@@ -140,24 +176,41 @@ export class ResponsesSseAccumulator {
       return
     }
     if (kind === 'response.output_item.added') {
-      const idx = (ev as any).output_index ?? this.items.size
       const item = (ev as any).item as ResponsesOutputItem | undefined
-      if (item) this.items.set(idx, { item: cloneItem(item) })
+      if (!item) return
+      this.items.push({ item: cloneItem(item) })
+      this.openIndex = this.items.length - 1
       return
     }
     if (kind === 'response.output_item.done') {
-      const idx = (ev as any).output_index
       const item = (ev as any).item as ResponsesOutputItem | undefined
       if (item == null) return
-      const key = typeof idx === 'number' ? idx : this.findItemSlotByItemId(item)
-      if (key == null) return
-      // Terminal item event is canonical for that slot — overwrite.
-      this.items.set(key, { item: cloneItem(item) })
+      const itemId = (item as { id?: string }).id
+      // Prefer matching by item.id (works even if we missed the
+      // `.added` event or items were emitted out of band). Fall back
+      // to the currently-open slot.
+      let matchedIdx: number | undefined
+      if (itemId) {
+        for (let i = 0; i < this.items.length; i++) {
+          if ((this.items[i].item as { id?: string }).id === itemId) {
+            matchedIdx = i
+            break
+          }
+        }
+      }
+      if (matchedIdx == null) matchedIdx = this.openIndex
+      if (matchedIdx != null && matchedIdx < this.items.length) {
+        this.items[matchedIdx] = { item: cloneItem(item) }
+      } else {
+        // Never saw an `.added` for this item — synthesise the slot so
+        // the output isn't lost.
+        this.items.push({ item: cloneItem(item) })
+      }
+      this.openIndex = undefined
       return
     }
     if (kind === 'response.output_text.delta') {
-      const idx = (ev as any).output_index
-      const b = typeof idx === 'number' ? this.items.get(idx) : undefined
+      const b = this.slotFor((ev as any).item_id)
       if (!b) return
       const delta = String((ev as any).delta ?? '')
       b.text = (b.text ?? '') + delta
@@ -175,8 +228,7 @@ export class ResponsesSseAccumulator {
       return
     }
     if (kind === 'response.function_call_arguments.delta') {
-      const idx = (ev as any).output_index
-      const b = typeof idx === 'number' ? this.items.get(idx) : undefined
+      const b = this.slotFor((ev as any).item_id)
       if (!b) return
       const delta = String((ev as any).delta ?? '')
       b.args = (b.args ?? '') + delta
@@ -186,8 +238,7 @@ export class ResponsesSseAccumulator {
       return
     }
     if (kind === 'response.custom_tool_call_input.delta') {
-      const idx = (ev as any).output_index
-      const b = typeof idx === 'number' ? this.items.get(idx) : undefined
+      const b = this.slotFor((ev as any).item_id)
       if (!b) return
       const delta = String((ev as any).delta ?? '')
       b.args = (b.args ?? '') + delta
@@ -197,35 +248,29 @@ export class ResponsesSseAccumulator {
       return
     }
     if (kind === 'response.reasoning_text.delta') {
-      const idx = (ev as any).output_index
-      const b = typeof idx === 'number' ? this.items.get(idx) : undefined
-      if (!b) return
+      const b = this.slotFor((ev as any).item_id)
+      if (!b || b.item.type !== 'reasoning') return
       const delta = String((ev as any).delta ?? '')
       b.reasoningText = (b.reasoningText ?? '') + delta
-      if (b.item.type === 'reasoning') {
-        const r = b.item as ResponsesReasoningItem
-        const content = r.content ?? []
-        const existing = content.find((c) => c.type === 'text')
-        if (existing) existing.text = b.reasoningText
-        else content.push({ type: 'text', text: b.reasoningText })
-        r.content = content
-      }
+      const r = b.item as ResponsesReasoningItem
+      const content = r.content ?? []
+      const existing = content.find((c) => c.type === 'text')
+      if (existing) existing.text = b.reasoningText
+      else content.push({ type: 'text', text: b.reasoningText })
+      r.content = content
       return
     }
     if (kind === 'response.reasoning_summary_text.delta') {
-      const idx = (ev as any).output_index
-      const b = typeof idx === 'number' ? this.items.get(idx) : undefined
-      if (!b) return
+      const b = this.slotFor((ev as any).item_id)
+      if (!b || b.item.type !== 'reasoning') return
       const delta = String((ev as any).delta ?? '')
       b.reasoningSummaryText = (b.reasoningSummaryText ?? '') + delta
-      if (b.item.type === 'reasoning') {
-        const r = b.item as ResponsesReasoningItem
-        const summary = r.summary ?? []
-        const existing = summary.find((c) => c.type === 'summary_text')
-        if (existing) existing.text = b.reasoningSummaryText
-        else summary.push({ type: 'summary_text', text: b.reasoningSummaryText })
-        r.summary = summary
-      }
+      const r = b.item as ResponsesReasoningItem
+      const summary = r.summary ?? []
+      const existing = summary.find((c) => c.type === 'summary_text')
+      if (existing) existing.text = b.reasoningSummaryText
+      else summary.push({ type: 'summary_text', text: b.reasoningSummaryText })
+      r.summary = summary
       return
     }
     // Catch-all kinds (errors with bare `{type:"error", error}`, future
@@ -240,18 +285,6 @@ export class ResponsesSseAccumulator {
       // Don't let an early partial wipe out a populated output array.
       output: partial.output ?? this.envelope?.output ?? [],
     }
-  }
-
-  // Slow fallback when an `output_item.done` event omits `output_index`.
-  // We try to match by `item.id` against any of our running builders;
-  // returns null if no match (very rare).
-  private findItemSlotByItemId(item: ResponsesOutputItem): number | null {
-    const id = (item as any).id
-    if (!id) return null
-    for (const [k, b] of this.items) {
-      if ((b.item as any).id === id) return k
-    }
-    return null
   }
 }
 
