@@ -69,8 +69,12 @@ jobs:
           $logPath = "$env:GITHUB_WORKSPACE\cli.log"
           $errPath = "$env:GITHUB_WORKSPACE\cli.err.log"
 
+          # --no-agent is required as of 0.2.1: bare `agentmind-cli` now
+          # launches Claude Code, which would fail immediately on a
+          # runner with no stdin/no claude binary. We're testing the
+          # static-asset / capture-API endpoints here, not the launcher.
           $proc = Start-Process node `
-            -ArgumentList 'bin/cli.js','--port','8189','--no-open' `
+            -ArgumentList 'bin/cli.js','--port','8189','--no-agent','--no-open' `
             -PassThru `
             -NoNewWindow `
             -RedirectStandardOutput $logPath `

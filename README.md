@@ -51,16 +51,16 @@ npm install -g agentmind-cli
 
 # Launch your agent through AgentMind — one command, zero config,
 # no API keys required.
-agentmind-cli claude           # or: agentmind-cli claude "fix the build"
+agentmind-cli                  # defaults to Claude Code
 agentmind-cli codex            # or: agentmind-cli codex exec "ship the PR"
 ```
 
-That's it. AgentMind boots the dashboard, opens it in your browser,
-injects the right env / config so your agent talks to the proxy, and
-hands the terminal off to the agent's TUI. Every prompt you type shows
-up in the dashboard as a new project — live, while the agent is still
-streaming. When the agent exits the dashboard keeps running so you can
-browse the captured trace. Hit Ctrl+C to stop AgentMind.
+That's it. AgentMind boots the dashboard, injects the right env / config
+so your agent talks to the proxy, and hands the terminal off to the
+agent's TUI. Every prompt you type shows up in the dashboard as a new
+project — live, while the agent is still streaming. When the agent
+exits the dashboard keeps running so you can browse the captured trace.
+Hit Ctrl+C to stop AgentMind.
 
 > Both agents work with their **existing logins** — `claude login` for
 > Claude Code, `codex login` for Codex CLI. No API key wrangling. The
@@ -73,38 +73,41 @@ browse the captured trace. Hit Ctrl+C to stop AgentMind.
 Prefer `npx`?
 
 ```bash
+npx agentmind-cli              # claude by default
 npx agentmind-cli codex
 ```
 
 ### Just want the dashboard?
 
 ```bash
-agentmind-cli                  # dashboard on http://127.0.0.1:8088
-agentmind-cli --port 9090      # custom port
-agentmind-cli --no-open        # don't auto-open the browser
+agentmind-cli --no-agent       # dashboard on http://127.0.0.1:8088, no agent
+agentmind-cli --no-agent --port 9090      # custom port
+agentmind-cli --no-agent --no-open        # don't auto-open the browser
 ```
 
 Then start your agent yourself — see [Manual setup](#manual-setup) below.
 
 **Supported agents** (v0.2):
 
-| Agent      | Upstream                | Proxy endpoint we capture | Launcher           |
-| ---------- | ----------------------- | ------------------------- | ------------------ |
-| Claude Code| `api.anthropic.com`     | `POST /v1/messages`       | `agentmind-cli claude` |
-| Codex CLI  | `api.openai.com`        | `POST /v1/responses`      | `agentmind-cli codex`  |
+| Agent      | Upstream                | Proxy endpoint we capture | Launcher                            |
+| ---------- | ----------------------- | ------------------------- | ----------------------------------- |
+| Claude Code| `api.anthropic.com`     | `POST /v1/messages`       | `agentmind-cli` (or `… claude`)     |
+| Codex CLI  | `api.openai.com`        | `POST /v1/responses`      | `agentmind-cli codex`               |
 
-Both agents land in the same cwd-keyed project (so if you switch between
-them in one directory, you see both threads against the same workspace).
-The sidebar tags non-default agents with a small `codex` chip so a mixed
-inbox stays scannable.
+Projects are keyed by `(cwd, agent)` — running both Claude and Codex in
+the same directory produces two distinct projects so each one's
+conversation chain stays coherent. The sidebar tags every project with
+a small agent chip (Claude = peach, Codex = lavender) so a mixed inbox
+stays scannable at a glance.
 
 Flags (must come BEFORE the subcommand):
 
-| Flag             | Default       | Notes                                      |
-| ---------------- | ------------- | ------------------------------------------ |
-| `--port <n>`     | `8088`        | Listen port (and the URL we hand the agent) |
-| `--data <dir>`   | `~/.agentmind` | Where the JSONL projects live              |
-| `--no-open`      | _off_         | Skip the auto-open browser step            |
+| Flag             | Default       | Notes                                                  |
+| ---------------- | ------------- | ------------------------------------------------------ |
+| `--port <n>`     | `8088`        | Listen port (and the URL we hand the agent)            |
+| `--data <dir>`   | `~/.agentmind` | Where the JSONL projects live                          |
+| `--no-agent`     | _off_         | Skip launching an agent — dashboard only               |
+| `--no-open`      | _off_         | Skip the auto-open browser step (`--no-agent` only)    |
 
 Run `agentmind-cli --help` for the full reference.
 
@@ -145,12 +148,13 @@ All capture is local-first JSONL — never leaves your machine.
 ```
 ~/.agentmind/
 └── projects/
-    └── <projectId>.jsonl     # projectId = sha256(cwd).slice(0,16)
+    └── <projectId>.jsonl     # projectId = sha256(cwd, agent).slice(0,16)
 ```
 
-One file per cwd — every `claude` run in the same directory, across
-days and proxy restarts, appends to the same file. Each line is one
-JSON record:
+One file per `(cwd, agent)` pair — every `claude` run in the same
+directory appends to the Claude file for that cwd, every `codex` run
+to the Codex file. Pre-0.2.2 single-cwd files are migrated to the new
+scheme on first boot. Each line is one JSON record:
 
 | `type`        | When written                              | Purpose                          |
 | ------------- | ----------------------------------------- | -------------------------------- |
@@ -188,8 +192,8 @@ Adding a third protocol is one `ProtocolAdapter` away — see
 
 ## Manual setup
 
-You don't have to use the launchers — `agentmind-cli` (no subcommand)
-just runs the dashboard, and you can point any agent at it yourself.
+You don't have to use the launchers — `agentmind-cli --no-agent`
+runs the dashboard alone, and you can point any agent at it yourself.
 
 ### Claude Code
 
