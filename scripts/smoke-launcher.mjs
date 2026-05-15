@@ -71,11 +71,15 @@ makeShim('claude')
 const cliEntry = join(repo, 'bin', 'cli.js')
 const PORT = 18293
 
-async function runOne(agent) {
+async function runOne(agent, opts = {}) {
   if (existsSync(snapshotPath)) rmSync(snapshotPath)
+  // When `agent` is `null` we exercise the 0.2.1 default behavior:
+  // omit the subcommand entirely, expect the CLI to fill in `claude`
+  // on our behalf and pass no extra positional args through.
+  const subArgv = agent ? [agent, 'hello'] : []
   const child = spawn(
     process.execPath,
-    [cliEntry, '--port', String(PORT), '--data', dataDir, '--no-open', agent, 'hello'],
+    [cliEntry, '--port', String(PORT), '--data', dataDir, '--no-open', ...subArgv],
     {
       cwd: repo,
       env: {
@@ -148,6 +152,23 @@ if (claudeSnap.env.ANTHROPIC_BASE_URL !== `http://127.0.0.1:${PORT}`) {
   throw new Error(`expected ANTHROPIC_BASE_URL, got ${claudeSnap.env.ANTHROPIC_BASE_URL}`)
 }
 log('claude OK — argv forwarded verbatim, ANTHROPIC_BASE_URL injected')
+
+// 0.2.1: `agentmind-cli` with NO subcommand should resolve to the
+// claude launcher (replaces the pre-0.2.1 dashboard-only default).
+// We pass `null` to runOne to omit the subcommand and `hello` arg
+// entirely, then assert the shim was invoked with the env Claude Code
+// expects.
+log('testing default (no subcommand) launcher...')
+const defaultSnap = await runOne(null)
+if (defaultSnap.argv.length !== 0) {
+  throw new Error(`default argv unexpected: ${JSON.stringify(defaultSnap.argv)}`)
+}
+if (defaultSnap.env.ANTHROPIC_BASE_URL !== `http://127.0.0.1:${PORT}`) {
+  throw new Error(
+    `default mode should launch claude, ANTHROPIC_BASE_URL got: ${defaultSnap.env.ANTHROPIC_BASE_URL}`,
+  )
+}
+log('default OK — bare `agentmind-cli` launched claude shim')
 
 rmSync(tmpBin, { recursive: true, force: true })
 rmSync(dataDir, { recursive: true, force: true })

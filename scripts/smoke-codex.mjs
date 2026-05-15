@@ -275,9 +275,15 @@ log('chatgpt-route stub listening on', CHATGPT_UPSTREAM_PORT)
 }
 
 // 2. Boot agentmind-cli pointed at BOTH stubs.
+// `--no-agent` is the 0.2.1 way to ask for dashboard-only mode. Without
+// it the CLI would try to launch claude, which (a) we don't want here
+// — these tests drive the HTTP proxy directly with stub bodies, not a
+// real agent — and (b) would fail immediately on a CI runner that has
+// no `claude` binary or no stdin attached.
 const cli = spawn(process.execPath, [resolve(repo, 'bin', 'cli.js'),
   '--port', String(PROXY_PORT),
   '--data', dataDir,
+  '--no-agent',
   '--no-open',
 ], {
   cwd: repo,
@@ -640,6 +646,7 @@ await delay(200)
 const cli2 = spawn(process.execPath, [resolve(repo, 'bin', 'cli.js'),
   '--port', String(PROXY_PORT),
   '--data', dataDir,
+  '--no-agent',
   '--no-open',
 ], {
   cwd: repo,

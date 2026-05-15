@@ -12,26 +12,36 @@
 //      a dist/ — i.e. `pnpm dev` was the developer's intent)
 //      Spawns `vite dev` so HMR/typecheck work while iterating.
 //
-// And two invocation shapes:
+// And three invocation shapes:
 //
-//   a. Dashboard-only:  `agentmind-cli [flags...]`
-//      Boots the proxy and opens the browser. User wires their agent
-//      manually (or already has it pointed at us).
+//   a. Default:         `agentmind-cli [flags...] [-- agent-args...]`
+//      Equivalent to `agentmind-cli claude`. Claude Code is the
+//      assumed agent because it's the one most users came here for —
+//      AgentMind is a Claude-first product that also happens to
+//      capture Codex. Any positional args after `--` are forwarded to
+//      claude verbatim.
 //
-//   b. Launcher:        `agentmind-cli {claude|codex} [agent-args...]`
-//      Boots the proxy AND spawns the named agent in the foreground
-//      with the right env/config overrides so it talks to us. The
-//      dashboard stays running after the agent exits so the captured
-//      trace stays browsable until the user hits Ctrl+C.
+//   b. Explicit launcher:
+//                       `agentmind-cli {claude|codex} [agent-args...]`
+//      Same flow, but with the agent named on the command line.
+//      Pick this when you want Codex (default isn't codex) or when
+//      you want the choice to be obvious to a reader.
+//
+//   c. Dashboard-only:  `agentmind-cli --no-agent [flags...]`
+//      Boots the proxy + UI without launching an agent. Useful when
+//      you want to browse the captured trace later (your previous
+//      session already exited) or when you'd rather wire the agent
+//      up yourself.
 //
 // AgentMind flags must come BEFORE the subcommand. Anything after the
 // subcommand (including `--`-prefixed args) is forwarded verbatim to
 // the agent. Examples:
 //
-//     agentmind-cli                       # dashboard only
-//     agentmind-cli --port 9090           # dashboard on custom port
-//     agentmind-cli codex                 # dashboard + codex
+//     agentmind-cli                       # = agentmind-cli claude
+//     agentmind-cli --port 9090           # claude on custom port
+//     agentmind-cli codex                 # launch codex instead
 //     agentmind-cli codex "fix the build" # passes the prompt through
+//     agentmind-cli --no-agent            # dashboard only
 //     agentmind-cli --port 9090 claude exec --task "ship"
 
 import { spawn } from 'node:child_process'
@@ -85,6 +95,7 @@ function getFlagValue(args, name, fallback) {
 
 const wantsHelp = getFlag(preArgs, '--help') || getFlag(preArgs, '-h')
 const noOpen = getFlag(preArgs, '--no-open')
+const noAgent = getFlag(preArgs, '--no-agent')
 const forceDev = getFlag(preArgs, '--dev')
 const portArg = getFlagValue(preArgs, '--port', '8088')
 const dataArg = getFlagValue(preArgs, '--data', undefined)
@@ -94,26 +105,32 @@ if (wantsHelp) {
 agentmind-cli — a live window into your agent's mind
 
 USAGE:
-  agentmind-cli                     start dashboard, open browser
-  agentmind-cli codex [args...]     start dashboard + launch codex
-  agentmind-cli claude [args...]    start dashboard + launch claude
+  agentmind-cli                     start dashboard + launch claude (default)
+  agentmind-cli claude [args...]    same, explicit
+  agentmind-cli codex  [args...]    start dashboard + launch codex
+  agentmind-cli --no-agent          dashboard only (browse past traces)
 
 OPTIONS (must come BEFORE the subcommand):
   --port <n>        Listen port (default 8088)
   --data <dir>      Persist projects under <dir>/projects/<id>.jsonl
                     (default ~/.agentmind)
-  --no-open         Skip auto-opening the browser (dashboard mode only)
-  --dev             Force vite dev mode (developers only, dashboard only)
+  --no-open         Skip auto-opening the browser (--no-agent only)
+  --no-agent        Don't launch an agent; boot the dashboard alone
+  --dev             Force vite dev mode (developers only, --no-agent only)
   -h, --help        Show this message
 
 LAUNCHER NOTES:
-  * \`agentmind-cli codex\` and \`agentmind-cli claude\` inject the right
-    env / config so the agent talks to AgentMind. No manual setup.
+  * \`agentmind-cli\` defaults to Claude Code. Use \`codex\` explicitly
+    to launch Codex CLI instead.
+  * The launcher injects the right env / config so the agent talks to
+    AgentMind. No manual setup, no API key wrangling — it reuses your
+    existing \`claude login\` / \`codex login\`.
   * Anything after the subcommand is forwarded verbatim to the agent.
   * When the agent exits the dashboard stays running so the captured
     trace stays browsable. Press Ctrl+C to stop AgentMind.
 
 MANUAL SETUP (if you'd rather start your own agent):
+  agentmind-cli --no-agent          # then in another terminal:
   Claude Code:  ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
   Codex CLI:    see README.md "Manual setup" — needs a Codex provider
                 block with requires_openai_auth=true and
@@ -135,13 +152,18 @@ const distCli = resolve(projectRoot, 'dist', 'agentmind', 'cli.mjs')
 const useProd = !forceDev && existsSync(distCli)
 
 async function maybeOpenBrowser() {
+  // Only reachable from the --no-agent path. The default `agentmind-cli`
+  // invocation now launches Claude itself, so there's no "point your
+  // agent at us" step to print there.
   if (noOpen) return
   await delay(200)
   process.stdout.write(
-    `\n► Point your agent at agentmind:\n\n` +
-      `    Claude Code:\n` +
-      `      ANTHROPIC_BASE_URL=${url} claude\n\n` +
-      `    Codex CLI:  agentmind-cli codex     (one-liner — handles config)\n\n`,
+    `\n► Dashboard-only mode (no agent launched).\n\n` +
+      `    Browse past traces at:           ${url}\n` +
+      `    Start a fresh capture session:   agentmind-cli claude   (or: codex)\n` +
+      `    Wire your agent manually:\n` +
+      `      Claude Code:  ANTHROPIC_BASE_URL=${url} claude\n` +
+      `      Codex CLI:    see README.md "Manual setup"\n\n`,
   )
   try {
     const { default: open } = await import('open')
@@ -332,24 +354,36 @@ async function runLauncher(agent, extraArgs) {
 }
 
 // ─── Dispatch ────────────────────────────────────────────────────────────
+//
+// Three branches, picked in this order:
+//   1. Launcher: subcommand was given OR no subcommand AND no --no-agent.
+//      The no-subcommand case fills in `claude` as the default agent —
+//      that's the 0.2.1 UX shift away from the older dashboard-only
+//      default. If the user really wants the dashboard alone they pass
+//      --no-agent (case 2).
+//   2. Dashboard-only (prod): --no-agent or a non-launcher invocation
+//      that has dist/ available.
+//   3. Dashboard-only (dev): same as (2) but no dist/ → spawn vite.
 
-if (subcmd) {
+const resolvedSubcmd = subcmd ?? (noAgent ? null : 'claude')
+
+if (resolvedSubcmd) {
   if (!useProd) {
     process.stderr.write(
-      `agentmind-cli: the \`${subcmd}\` launcher requires a built dist/.\n` +
+      `agentmind-cli: the \`${resolvedSubcmd}\` launcher requires a built dist/.\n` +
         `If you're hacking on agentmind, run \`pnpm build\` first or use\n` +
-        `\`agentmind-cli\` (no subcommand) for the vite dev dashboard.\n`,
+        `\`agentmind-cli --no-agent --dev\` for the vite dev dashboard.\n`,
     )
     process.exit(1)
   }
   try {
-    await runLauncher(subcmd, agentArgs)
+    await runLauncher(resolvedSubcmd, agentArgs)
   } catch (err) {
     process.stderr.write(`agentmind-cli: launcher failed\n${err?.stack ?? err}\n`)
     process.exit(1)
   }
 } else if (useProd) {
-  // Production dashboard-only: in-process, no child node, no vite.
+  // Dashboard-only (prod): in-process, no child node, no vite.
   try {
     const mod = await import(pathToFileURL(distCli).toString())
     await mod.start({ port, host })
