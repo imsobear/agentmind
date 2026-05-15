@@ -8,6 +8,7 @@ import {
   Type,
   User,
   Bot,
+  Info,
 } from 'lucide-react'
 import type { InteractionFull } from '#/lib/api'
 import type {
@@ -106,8 +107,20 @@ function MessageSection({
   const blocks: ContentBlock[] = typeof m.content === 'string'
     ? [{ type: 'text', text: m.content }]
     : m.content
-  const inlineSummary = useMemo(() => oneLineMessageSummary(blocks), [blocks])
   const isUser = m.role === 'user'
+  // Claude Code injects `<system-reminder>…</system-reminder>` wrappers
+  // into user messages (skills list, CLAUDE.md context, plan-mode
+  // markers, …) ahead of the actual prompt. Expanding the message used
+  // to dump all of that as wall-of-text, burying "hello claude" under
+  // 30+ lines of boilerplate. We split each user text block into the
+  // reminder chunks (rendered as collapsed chips) + remaining prose
+  // (rendered as a normal text block) so the human-typed part is
+  // immediately visible without losing the reminders entirely.
+  const displayBlocks: DisplayBlock[] = useMemo(
+    () => (isUser ? splitReminders(blocks) : blocks),
+    [blocks, isUser],
+  )
+  const inlineSummary = useMemo(() => oneLineMessageSummary(blocks), [blocks])
 
   const title = (
     <span className="flex items-baseline gap-0.5">
@@ -187,30 +200,133 @@ function MessageSection({
         summary={summary}
         defaultOpen={isUserPrompt}
       >
-        <NumberedBlocks blocks={blocks} />
+        <NumberedBlocks blocks={displayBlocks} />
       </Section>
     </div>
   )
 }
 
-function NumberedBlocks({ blocks }: { blocks: ContentBlock[] }) {
+// A `system-reminder` "block" doesn't exist in the wire protocol — it's
+// a UI-only synthetic that lets the renderer collapse Claude Code's
+// framework-injected reminders without losing them. The split happens
+// in `splitReminders`.
+type SystemReminderBlock = { type: 'system_reminder'; text: string }
+type DisplayBlock = ContentBlock | SystemReminderBlock
+
+function NumberedBlocks({ blocks }: { blocks: DisplayBlock[] }) {
   if (!blocks.length) {
     return <div className="text-muted-foreground italic px-2 py-1">(no blocks)</div>
   }
   return (
     <div className="flex flex-col gap-1.5">
-      {blocks.map((b, i) => (
-        // Cap each block so oversized text/thinking/tool_result bodies
-        // scroll inside the row rather than pushing the iter card off
-        // the screen. No leading numeric gutter — every block kind
-        // already carries its own coloured chrome (text / thinking /
-        // tool_use / tool_result) so the ordinal index added nothing.
-        <div key={i} className="max-h-80 overflow-auto">
-          <ContentBlockView block={b} />
-        </div>
-      ))}
+      {blocks.map((b, i) =>
+        b.type === 'system_reminder' ? (
+          // Reminder chips manage their own height (collapsed by
+          // default), so we don't wrap them in the scroll-capped row
+          // the other blocks use — that would add an empty scrollbar
+          // gutter around a one-line button.
+          <SystemReminderChip key={i} text={b.text} />
+        ) : (
+          // Cap each block so oversized text/thinking/tool_result bodies
+          // scroll inside the row rather than pushing the iter card off
+          // the screen. No leading numeric gutter — every block kind
+          // already carries its own coloured chrome (text / thinking /
+          // tool_use / tool_result) so the ordinal index added nothing.
+          <div key={i} className="max-h-80 overflow-auto">
+            <ContentBlockView block={b} />
+          </div>
+        ),
+      )}
     </div>
   )
+}
+
+// Split a single user text block into [reminder chunks…, prose].
+// Non-text blocks pass through untouched. We preserve the on-wire
+// ordering — Claude Code emits reminders BEFORE the user's actual
+// prompt, and matching that order keeps the rendered view a faithful
+// representation of what the model saw.
+function splitReminders(blocks: ContentBlock[]): DisplayBlock[] {
+  const out: DisplayBlock[] = []
+  for (const b of blocks) {
+    if (b.type !== 'text') {
+      out.push(b)
+      continue
+    }
+    const segments = splitTextReminders(b.text)
+    if (segments.length === 1 && segments[0].kind === 'prose') {
+      out.push(b)
+      continue
+    }
+    for (const seg of segments) {
+      if (seg.kind === 'reminder') {
+        out.push({ type: 'system_reminder', text: seg.text })
+      } else if (seg.text.trim()) {
+        // We intentionally drop cache_control on the prose remainder —
+        // the original block-level cache_control applied to the whole
+        // text-with-reminders payload Anthropic actually received, not
+        // to our prose subset. Showing it on just the prose half would
+        // be misleading. Power users can still find the original via
+        // the raw-JSON dialog.
+        out.push({ type: 'text', text: seg.text })
+      }
+    }
+  }
+  return out
+}
+
+function splitTextReminders(s: string): Array<{ kind: 'reminder' | 'prose'; text: string }> {
+  const segments: Array<{ kind: 'reminder' | 'prose'; text: string }> = []
+  const re = /<system-reminder>([\s\S]*?)<\/system-reminder>/g
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) segments.push({ kind: 'prose', text: s.slice(last, m.index) })
+    segments.push({ kind: 'reminder', text: m[1] })
+    last = re.lastIndex
+  }
+  if (last < s.length) segments.push({ kind: 'prose', text: s.slice(last) })
+  return segments
+}
+
+function SystemReminderChip({ text }: { text: string }) {
+  const [open, setOpen] = useState(false)
+  const preview = useMemo(() => firstNonEmptyLine(text), [text])
+  return (
+    <div className="rounded border border-border/40 bg-muted/20">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 px-2 py-1 text-left text-[10px] uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+      >
+        <span className="shrink-0">
+          {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        </span>
+        <Info className="w-3 h-3 shrink-0" />
+        <span className="shrink-0">system-reminder</span>
+        {preview && (
+          <span className="normal-case tracking-normal text-muted-foreground/80 truncate min-w-0 flex-1">
+            · {preview}
+          </span>
+        )}
+        <span className="font-mono normal-case tracking-normal opacity-60 shrink-0 ml-auto">
+          {fmtChars(text.length)}c
+        </span>
+      </button>
+      {open && (
+        <pre className="px-3 py-2 border-t border-border/40 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-foreground/80 max-h-72 overflow-auto">
+          {text}
+        </pre>
+      )}
+    </div>
+  )
+}
+
+function firstNonEmptyLine(s: string): string {
+  for (const line of s.split('\n')) {
+    const t = line.trim()
+    if (t) return truncate(t, 100)
+  }
+  return ''
 }
 
 function normalizeSystem(sys: undefined | string | SystemBlock[]): SystemBlock[] {
