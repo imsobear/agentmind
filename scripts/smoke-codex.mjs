@@ -611,6 +611,71 @@ log('  projectId =', anthropicProj.projectId)
 log('  cwd       =', anthropicProj.cwd)
 log('  agent     =', anthropicProj.agentType)
 
+// 6. Noise filters. Two paths to verify in one shot:
+//    a) `isMainInteractionFor` rejects Claude Code's framework-internal
+//       prompts (suggestion-mode / recap / compaction). The captured
+//       project ends up with messageCount=0 main interactions and
+//       isn't surfaced in the sidebar.
+//    b) `/api/projects` hides such empty projects by default, but
+//       returns them with `?showAll=1` so a debug deep-link still works.
+log('noise filter checks (framework-internal prompts + ?showAll)...')
+const NOISE_CWD = '/private/var/agentmind-noise-smoke/' + Math.random().toString(36).slice(2, 8)
+const noisePost = await streamPost('/v1/messages', {
+  model: 'claude-3-5-sonnet-test',
+  max_tokens: 100,
+  stream: true,
+  // Same shape as the regression call above but with the
+  // recap-after-idle prompt Claude Code emits when the user comes back
+  // from a coffee break — should be filtered out.
+  system: `You are Claude. cwd: ${NOISE_CWD}`,
+  tools: [{ name: 'noop', description: 'noop', input_schema: { type: 'object' } }],
+  messages: [
+    {
+      role: 'user',
+      content:
+        'The user stepped away and is coming back. Recap in under 40 words, ' +
+        '1-2 plain sentences, no markdown. Lead with the task.',
+    },
+  ],
+})
+if (noisePost.status !== 200) throw new Error('noise call proxy returned ' + noisePost.status)
+await delay(150)
+const listDefault = await request('GET', '/api/projects')
+// Default list: must still be 3 (the noise project is hidden).
+if (listDefault.body.length !== 3) {
+  throw new Error(
+    'expected 3 projects in filtered list, got ' +
+      listDefault.body.length +
+      ': ' +
+      JSON.stringify(listDefault.body.map((p) => p.cwd)),
+  )
+}
+if (listDefault.body.some((p) => p.cwd === NOISE_CWD)) {
+  throw new Error('framework-internal project leaked into default list')
+}
+// showAll: must include the noise project.
+const listAll = await request('GET', '/api/projects?showAll=1')
+if (listAll.body.length !== 4) {
+  throw new Error(
+    'expected 4 projects with showAll=1, got ' +
+      listAll.body.length +
+      ': ' +
+      JSON.stringify(listAll.body.map((p) => p.cwd)),
+  )
+}
+const noiseProj = listAll.body.find((p) => p.cwd === NOISE_CWD)
+if (!noiseProj) throw new Error('noise project missing from showAll list')
+if (noiseProj.messageCount !== 0) {
+  throw new Error(
+    'expected noise project messageCount=0 (framework prompt filtered), got ' +
+      noiseProj.messageCount,
+  )
+}
+log('OK — framework-internal prompt filtered:')
+log('  default list  =', listDefault.body.length, 'projects')
+log('  showAll list  =', listAll.body.length, 'projects (1 hidden)')
+log('  noise project = messageCount=0 on disk, visible via showAll')
+
 cli2.kill('SIGINT')
 upstream.close()
 chatGptStub.close()

@@ -113,10 +113,35 @@ function notFound(res: ServerResponse) {
   sendJson(res, 404, { error: 'not_found' })
 }
 
+// Sentinel cwd values that mark a "shapeless" project — captured because
+// the proxy saw traffic but couldn't anchor it to a real workspace.
+// These accumulate from:
+//   - Pre-0.1.7 records (literal "_orphan_" / "no-cwd" rendered as the cwd)
+//   - Codex requests that redact the cwd to "…" (Unicode horizontal ellipsis,
+//     U+2026) in its <environment_context> block
+//   - Unknown-agent traffic we couldn't classify
+// We hide them from the sidebar; the underlying JSONL stays on disk and
+// /api/projects/:id still serves them so a deep link keeps working.
+const SENTINEL_CWDS = new Set(['_orphan_', 'no-cwd', '\u2026', 'unknown'])
+
+function isInterestingProject(p: {
+  cwd?: string
+  messageCount: number
+}): boolean {
+  // Projects without a single main-agent interaction are framework noise
+  // (Claude Code haiku helpers, Codex compaction summarisers, abandoned
+  // subagent workdirs). They're never the answer to "what did the agent
+  // do for me today" — hide them.
+  if (p.messageCount === 0) return false
+  if (!p.cwd) return false
+  if (SENTINEL_CWDS.has(p.cwd)) return false
+  return true
+}
+
 // Build the API list response: a flat array of project summaries.
-function listProjects() {
+function listProjects(options: { showAll?: boolean } = {}) {
   const rows = storage.listProjects()
-  return rows.map(({ projectId, mtime, size }) => {
+  const summaries = rows.map(({ projectId, mtime, size }) => {
     const { project, messages, interactions } = storage.loadProject(projectId)
     let totalInput = 0
     let totalOutput = 0
@@ -190,6 +215,8 @@ function listProjects() {
       lastInteractionAt: lastMain?.endedAt ?? lastMain?.startedAt,
     }
   })
+  if (options.showAll) return summaries
+  return summaries.filter(isInterestingProject)
 }
 
 // Best-effort cwd resolution for a stored project. The very first
@@ -360,9 +387,11 @@ export function createCaptureMiddleware() {
       return
     }
 
-    // /api/projects
+    // /api/projects (?showAll=1 disables the noise filter so debug
+    // links into _orphan_ / empty / sentinel-cwd projects keep working)
     if (urlPath === '/api/projects') {
-      sendJson(res, 200, listProjects())
+      const showAll = /[?&]showAll=1(?:&|$)/.test(req.url ?? '')
+      sendJson(res, 200, listProjects({ showAll }))
       return
     }
 

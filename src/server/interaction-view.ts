@@ -34,14 +34,68 @@ export function modelOf(it: CapturedInteraction): string | undefined {
   return req?.model
 }
 
-// "Main" = the real agent's main-thread call, not a framework helper
-// (e.g. Claude Code's haiku title-gen, classifier). The current
-// heuristic is the same for both protocols — at least one tool defined
-// in the request — but kept here so a future protocol can override.
+// "Main" = the real agent's main-thread call, not a framework helper.
+//
+// Two layers of filtering, applied in order:
+//
+//   1. Tool-count gate. Helper calls (Claude Code's haiku title-gen,
+//      topic classifier; Codex CLI's compaction summariser) ship with
+//      zero tools — the model has nothing to do but answer in text.
+//      Anything with `tools.length >= 1` is at least a candidate for
+//      being the main agent.
+//
+//   2. Known-prompt gate. Claude Code re-uses the main agent's full
+//      tool set for several internal-only calls (auto-recap when the
+//      user idles, "suggestion mode" lookahead, context compaction).
+//      They satisfy gate #1 but are NOT user-driven and showing them
+//      as messages just makes the project history harder to read.
+//      We reject them by matching the latest user-prompt against a
+//      small list of stable framework prefixes — chosen so a real
+//      user typing the same words would either start with `>` quoting
+//      or different framing, and so a false-positive only loses a
+//      visible message (the underlying record stays on disk).
 export function isMainInteractionFor(it: CapturedInteraction): boolean {
   const req = it.request as any
   const tools = req?.tools
-  return Array.isArray(tools) && tools.length >= 1
+  if (!Array.isArray(tools) || tools.length < 1) return false
+  if (isFrameworkInternalPrompt(it)) return false
+  return true
+}
+
+// Prefix patterns that identify a framework-injected user turn. Kept
+// public so docs / tests can reference the same list.
+export const FRAMEWORK_INTERNAL_PROMPT_PREFIXES: Record<AgentType, string[]> = {
+  'claude-code': [
+    // Auto-recap when the user comes back from idle. Verbatim prefix
+    // emitted by Claude Code 1.x.
+    'The user stepped away and is coming back. Recap',
+    // "What might the user type next?" lookahead. Always wrapped in
+    // square-bracket framing.
+    '[SUGGESTION MODE:',
+    // Context compaction call — Claude Code summarises the running
+    // transcript when token usage gets high.
+    '# IMPORTANT! Output context summary',
+    // Slash-command "init" probe that lists tools without doing work.
+    'Your task is to create a new file called CLAUDE.md',
+  ],
+  // We don't yet have a confirmed Codex framework-internal prompt that
+  // makes it past the tool-count gate. Codex's compaction call ships
+  // with tools=[] so it's filtered at gate #1.
+  'codex-cli': [],
+  unknown: [],
+}
+
+function isFrameworkInternalPrompt(it: CapturedInteraction): boolean {
+  const agent = agentTypeOf(it)
+  const prefixes = FRAMEWORK_INTERNAL_PROMPT_PREFIXES[agent]
+  if (!prefixes?.length) return false
+  const text = latestUserTextFromRequest(it)
+  if (!text) return false
+  const head = text.trimStart()
+  for (const p of prefixes) {
+    if (head.startsWith(p)) return true
+  }
+  return false
 }
 
 // Count tool invocations in the response.
