@@ -8,7 +8,7 @@
 //   <pkg>/dist/client/             ← static client assets (hashed)
 //
 // Request routing order:
-//   1. capture middleware  → /v1/messages, /api/*
+//   1. capture middleware  → /v1/messages, /v1/responses, /api/*
 //   2. static file server  → dist/client/* (long-cache)
 //   3. TanStack handler    → SSR HTML for everything else
 

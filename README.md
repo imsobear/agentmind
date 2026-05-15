@@ -50,13 +50,30 @@ Use it to:
 # 1. Run AgentMind (terminal A)
 npx agentmind-cli        # listens on http://127.0.0.1:8088 and opens browser
 
-# 2. Point Claude Code at it (terminal B)
+# 2. Point your agent at it (terminal B)
+
+# Claude Code (Anthropic Messages API)
 ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
+
+# …or Codex CLI (OpenAI Responses API)
+OPENAI_BASE_URL=http://127.0.0.1:8088/v1 codex
 ```
 
 That's it. Every prompt you type in terminal B shows up in the browser as a
 new row — live, while the agent is still streaming. No build step, no DB, no
 sign-up.
+
+**Supported agents** (v0.2):
+
+| Agent      | Upstream                | Proxy endpoint we capture |
+| ---------- | ----------------------- | ------------------------- |
+| Claude Code| `api.anthropic.com`     | `POST /v1/messages`       |
+| Codex CLI  | `api.openai.com`        | `POST /v1/responses`      |
+
+Both agents land in the same cwd-keyed project (so if you switch between
+them in one directory, you see both threads against the same workspace).
+The sidebar tags non-default agents with a small `codex` chip so a mixed
+inbox stays scannable.
 
 Install globally if you'd rather not type `npx`:
 
@@ -138,16 +155,17 @@ share a JSONL with a teammate without leaking your key.
 
 ## Supported agents
 
-| Agent          | Status                          |
-| -------------- | ------------------------------- |
-| Claude Code    | First-class, fully tested       |
-| Claude SDK / API direct callers | Works — set `ANTHROPIC_BASE_URL` |
-| Codex CLI      | Roadmap (OpenAI Responses API)  |
-| OpenCode       | Roadmap                         |
+| Agent                            | Status                                |
+| -------------------------------- | ------------------------------------- |
+| Claude Code                      | First-class, fully tested             |
+| Claude SDK / API direct callers  | Works — set `ANTHROPIC_BASE_URL`      |
+| Codex CLI                        | First-class (v0.2+) — set `OPENAI_BASE_URL` |
+| OpenCode                         | Roadmap                               |
+| Codex Desktop / Claude Desktop   | Not yet (no documented proxy hook)    |
 
-Anything that respects `ANTHROPIC_BASE_URL` and speaks the Anthropic
-Messages API works today. The protocol-agnostic capture layer is on the
-roadmap so we can extend the same UI to OpenAI-shaped traffic.
+Anything that respects `ANTHROPIC_BASE_URL` (Anthropic Messages API) or
+`OPENAI_BASE_URL` (OpenAI Responses API) is captured today. Adding a
+third protocol is one `ProtocolAdapter` away — see `src/server/adapters.ts`.
 
 ## Tech stack
 
@@ -175,15 +193,19 @@ src/
 │   ├── ActionExecutionSegment.tsx local tool execution between calls
 │   └── ui/                       shadcn primitives + JSON dialog
 ├── lib/
-│   ├── anthropic-types.ts        API schema
+│   ├── anthropic-types.ts        Anthropic Messages API schema
+│   ├── openai-responses-types.ts OpenAI Responses API schema (Codex)
 │   └── api.ts                    typed fetch + subscribeLive helper
 └── server/                       pure node, no React
+    ├── adapters.ts               protocol adapters (one per agent)
     ├── middleware.ts             Connect middleware (mounted in vite.config.ts)
-    ├── proxy.ts                  /v1/messages forwarder + SSE tee
+    ├── proxy.ts                  generic forwarder + SSE tee (per adapter)
     ├── liveRegistry.ts           in-memory live-streaming sessions
     ├── grouping.ts               cwd-based project/message inference
     ├── aggregate.ts              raw capture → display model
+    ├── interaction-view.ts       per-protocol view extractors
     ├── sse.ts                    Anthropic SSE parser
+    ├── responses-sse.ts          OpenAI Responses SSE parser
     └── storage.ts                JSONL persistence
 
 bin/cli.js                        global `agentmind-cli` entry
@@ -205,17 +227,22 @@ boots a plain `node:http` server in under 100ms.
 
 Optional env vars (testing/dev only — not user-facing):
 
-| Var                       | Default                       | Effect                                      |
-| ------------------------- | ----------------------------- | ------------------------------------------- |
-| `AGENTMIND_DATA_DIR`      | `~/.agentmind`                | Override storage directory                  |
-| `AGENTMIND_UPSTREAM`      | `https://api.anthropic.com`   | Override upstream (integration testing)     |
-| `AGENTMIND_VERBOSE`       | `1`                           | Set to `0` to silence per-request logs      |
+| Var                           | Default                       | Effect                                       |
+| ----------------------------- | ----------------------------- | -------------------------------------------- |
+| `AGENTMIND_DATA_DIR`          | `~/.agentmind`                | Override storage directory                   |
+| `AGENTMIND_UPSTREAM_ANTHROPIC`| `https://api.anthropic.com`   | Override Anthropic upstream (test harness)   |
+| `AGENTMIND_UPSTREAM_OPENAI`   | `https://api.openai.com`      | Override OpenAI upstream (Codex test harness)|
+| `AGENTMIND_UPSTREAM`          | _(unset)_                     | Legacy alias for `AGENTMIND_UPSTREAM_ANTHROPIC` |
+| `AGENTMIND_VERBOSE`           | `1`                           | Set to `0` to silence per-request logs       |
 
 ## Roadmap
 
-- [ ] OpenAI Responses API capture (Codex CLI, OpenCode)
+- [x] OpenAI Responses API capture (Codex CLI) — v0.2
+- [ ] Codex CLI: action segments (function_call → function_call_output pairing)
+- [ ] Codex CLI: helper-call filtering (compaction summariser)
+- [ ] OpenCode CLI adapter
 - [ ] Cross-project search & filters
-- [ ] Diff view between adjacent iterations' `messages` arrays
+- [ ] Diff view between adjacent iterations' transcripts
 - [ ] Shareable "trace bundles" (export a sanitized project as a tarball)
 
 ## Contributing

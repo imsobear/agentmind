@@ -87,6 +87,18 @@ function ProjectRow({ p, active }: { p: ProjectListItem; active: boolean }) {
         <span className="font-medium text-foreground truncate">
           {p.cwd ? lastPathSeg(p.cwd) : p.projectId.slice(0, 8)}
         </span>
+        {p.agentType && p.agentType !== 'claude-code' && (
+          // Show a tiny tag for non-default agents so a mixed sidebar
+          // (claude code in one cwd, codex cli in another) is scannable.
+          // Default Anthropic projects stay un-badged to avoid visual
+          // noise for the dominant case.
+          <span
+            className="text-[9px] uppercase tracking-wider font-mono text-muted-foreground bg-muted/60 rounded px-1 py-0 shrink-0"
+            title={agentTooltip(p.agentType)}
+          >
+            {agentShortLabel(p.agentType)}
+          </span>
+        )}
         <span className="text-muted-foreground ml-auto tabular-nums">
           {formatDistanceToNowStrict(time, { addSuffix: false })}
         </span>
@@ -117,6 +129,18 @@ function ProjectRow({ p, active }: { p: ProjectListItem; active: boolean }) {
       )}
     </Link>
   )
+}
+
+function agentShortLabel(a: string): string {
+  if (a === 'codex-cli') return 'codex'
+  if (a === 'claude-code') return 'claude'
+  return a
+}
+
+function agentTooltip(a: string): string {
+  if (a === 'codex-cli') return 'Captured via OpenAI Responses API (Codex CLI)'
+  if (a === 'claude-code') return 'Captured via Anthropic Messages API (Claude Code)'
+  return a
 }
 
 function lastPathSeg(p: string): string {

@@ -10,7 +10,13 @@ import {
   Bot,
 } from 'lucide-react'
 import type { InteractionFull } from '#/lib/api'
-import type { MessageParam, ToolDefinition, SystemBlock, ContentBlock } from '#/lib/anthropic-types'
+import type {
+  AnthropicRequest,
+  ContentBlock,
+  MessageParam,
+  SystemBlock,
+  ToolDefinition,
+} from '#/lib/anthropic-types'
 import { Badge } from '#/components/ui/badge'
 import { cn } from '#/lib/utils'
 
@@ -24,7 +30,10 @@ export function RequestPanel({
   // immediately spot what changed between consecutive LLM calls.
   prevMessageCount?: number
 }) {
-  const req = interaction.request
+  // This panel only ever renders for `agentType === 'claude-code'`
+  // (InteractionCard branches before mounting). Cast in one place so
+  // the rest of the component stays strongly typed.
+  const req = interaction.request as AnthropicRequest
   const sysBlocks = normalizeSystem(req.system)
   return (
     // All four kinds of "what was sent" — each message, the system

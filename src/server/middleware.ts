@@ -1,6 +1,7 @@
 // Connect-style middleware mounted into vite's dev/preview server.
 // Handles:
 //   POST /v1/messages          → proxy to api.anthropic.com (+ capture to JSONL)
+//   POST /v1/responses         → proxy to api.openai.com    (+ capture to JSONL)
 //   GET  /api/projects         → project list
 //   GET  /api/projects/:id     → project detail (messages + interaction stubs)
 //   GET  /api/projects/:id/interactions/:iid → full interaction record
@@ -18,10 +19,18 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { EventEmitter } from 'node:events'
 import { Storage } from './storage'
 import { Grouper } from './grouping'
-import { createMessagesProxy } from './proxy'
+import { createProtocolProxy } from './proxy'
+import { adapters, adapterForPath } from './adapters'
 import { aggregateMessages, isMainInteraction } from './aggregate'
 import { LiveRegistry, type LiveUpdateEvent, type LiveDoneEvent } from './liveRegistry'
-import type { CapturedInteraction } from '../lib/anthropic-types'
+import {
+  agentTypeOf,
+  countToolUses,
+  modelOf,
+  normaliseRequestForGrouping,
+  usageOf,
+} from './interaction-view'
+import type { AgentType, CapturedInteraction, MessageParam } from '../lib/anthropic-types'
 
 // Singletons — middleware lives for the lifetime of the dev server.
 const storage = new Storage()
@@ -29,18 +38,69 @@ const grouper = new Grouper({
   // Lazy-hydrate from disk on first sight of a cwd so message indices
   // keep increasing across proxy restarts. Without this hook, restarting
   // mid-project would start indices from 0 and confuse the UI.
-  hydrate: (cwd) => storage.hydrateProject(cwd),
+  hydrate: (cwd) => hydrateProject(cwd),
 })
 const liveRegistry = new LiveRegistry()
 const events = new EventEmitter()
 events.setMaxListeners(0)
 
-const proxy = createMessagesProxy({
-  storage,
-  grouper,
-  liveRegistry,
-  onEvent: (e) => events.emit('event', e),
-})
+// One proxy handler per protocol adapter. The handlers share the same
+// Grouper / Storage / LiveRegistry so different protocols' requests for
+// the same cwd land in the same project.
+const protocolProxies = new Map<string, ReturnType<typeof createProtocolProxy>>()
+for (const adapter of adapters) {
+  protocolProxies.set(
+    adapter.endpointPath,
+    createProtocolProxy(adapter, {
+      storage,
+      grouper,
+      liveRegistry,
+      onEvent: (e) => events.emit('event', e),
+    }),
+  )
+}
+
+// Re-build enough of a project's message-chain state for the Grouper to
+// extend it without resetting indices. The Storage doesn't know about
+// adapters, so the per-protocol "normalise messages for grouping" step
+// lives here.
+function hydrateProject(cwd: string) {
+  const { projectIdForCwd } = require('./projectId') as typeof import('./projectId')
+  const projectId = projectIdForCwd(cwd)
+  const { project, messages, interactions } = storage.loadProject(projectId)
+  if (!messages.length && !interactions.length) return undefined
+  const byMessage = new Map<string, CapturedInteraction[]>()
+  for (const it of interactions) {
+    const arr = byMessage.get(it.messageId) ?? []
+    arr.push(it)
+    byMessage.set(it.messageId, arr)
+  }
+  const out = messages.map((m) => {
+    const its = (byMessage.get(m.messageId) ?? []).sort((a, b) => a.index - b.index)
+    const last = its[its.length - 1]
+    const lastMessages: MessageParam[] = last ? normaliseRequestForGrouping(last) : []
+    let userPromptCount = 0
+    for (const mp of lastMessages) {
+      if (mp.role === 'user') {
+        if (typeof mp.content === 'string') {
+          if (mp.content.trim()) userPromptCount++
+        } else {
+          const hasToolResult = mp.content.some((b: any) => b.type === 'tool_result')
+          if (!hasToolResult) userPromptCount++
+        }
+      }
+    }
+    return {
+      messageId: m.messageId,
+      index: m.index,
+      lastMessages,
+      userPromptCount,
+      interactionCount: its.length,
+    }
+  })
+  const primaryAgent: AgentType = project?.primaryAgent ?? 'claude-code'
+  return { cwd, primaryAgent, messages: out }
+}
 
 function sendJson(res: ServerResponse, status: number, body: unknown) {
   res.statusCode = status
@@ -62,24 +122,28 @@ function listProjects() {
     let totalOutput = 0
     let totalCacheRead = 0
     let totalCacheWrite = 0
-    // Only main-agent interactions feed the summary. Helper haiku side-calls
-    // (topic classifier, post-processing) are framework noise; tokens spent
-    // on them are real but irrelevant to "what did the agent do".
+    // Only main-agent interactions feed the summary. Helper side-calls
+    // (Claude Code's haiku topic classifier; Codex CLI's compaction
+    // summariser) are framework noise; tokens spent on them are real
+    // but irrelevant to "what did the agent do".
     const modelOutputTokens = new Map<string, number>()
     let mainCount = 0
     let lastMain: CapturedInteraction | undefined
+    const agentTallies = new Map<AgentType, number>()
     for (const it of interactions) {
+      const a = agentTypeOf(it)
+      agentTallies.set(a, (agentTallies.get(a) ?? 0) + 1)
       if (!isMainInteraction(it)) continue
       mainCount++
       lastMain = it
-      const u = it.response?.usage
+      const u = usageOf(it)
       if (u) {
         totalInput += u.input_tokens ?? 0
         totalOutput += u.output_tokens ?? 0
         totalCacheRead += u.cache_read_input_tokens ?? 0
         totalCacheWrite += u.cache_creation_input_tokens ?? 0
       }
-      const m = it.request?.model
+      const m = modelOf(it)
       if (m) {
         modelOutputTokens.set(
           m,
@@ -96,12 +160,27 @@ function listProjects() {
         primaryModel = m
       }
     }
-    const aggregatedMessages = aggregateMessages(messages, interactions, countToolUseBlocks)
+    // Prefer the persisted primaryAgent (stamped at project creation);
+    // fall back to whichever agent contributed the most interactions in
+    // case we're looking at a pre-0.2 file that lacks the field.
+    let primaryAgent: AgentType | undefined = project?.primaryAgent
+    if (!primaryAgent) {
+      let agentMax = -1
+      for (const [a, c] of agentTallies) {
+        if (c > agentMax) {
+          agentMax = c
+          primaryAgent = a
+        }
+      }
+      primaryAgent = primaryAgent ?? 'claude-code'
+    }
+    const aggregatedMessages = aggregateMessages(messages, interactions, countToolUses)
     return {
       projectId,
       startedAt: project?.startedAt,
       cwd,
       model: primaryModel,
+      agentType: primaryAgent,
       mtime,
       sizeBytes: size,
       messageCount: aggregatedMessages.length,
@@ -113,35 +192,21 @@ function listProjects() {
   })
 }
 
-function extractCwdFromRequest(req: { system?: unknown } | undefined): string | undefined {
-  if (!req) return undefined
-  const sys = (req as any).system
-  let text = ''
-  if (typeof sys === 'string') text = sys
-  else if (Array.isArray(sys)) {
-    for (const b of sys) {
-      const t = (b as any).text
-      if (typeof t === 'string') text += t + '\n'
-    }
-  }
-  if (!text) return undefined
-  const m = text.match(/(?:cwd|working[_ ]?directory)\s*[:=]\s*([^\n]+)/i)
-  return m?.[1]?.trim() || undefined
-}
-
 // Best-effort cwd resolution for a stored project. The very first
 // request that opens a project sometimes lacks a cwd in its system
-// prompt (typical for haiku title-gen helpers), so the persisted
-// `project.cwd` can be undefined even though later interactions in the
-// same project clearly carry one. Falling back to a scan keeps every
-// UI surface (list / detail) showing the same value.
+// prompt (typical for Claude Code's haiku title-gen helpers), so the
+// persisted `project.cwd` can be undefined even though later
+// interactions in the same project clearly carry one. Falling back to
+// a per-protocol scan keeps every UI surface (list / detail) showing
+// the same value.
 function resolveProjectCwd(
   project: { cwd?: string } | undefined,
   interactions: CapturedInteraction[],
 ): string | undefined {
   if (project?.cwd) return project.cwd
   for (const it of interactions) {
-    const cwd = extractCwdFromRequest(it.request)
+    const adapter = adapters.find((a) => a.agentType === agentTypeOf(it))
+    const cwd = adapter?.extractCwd(it.request)
     if (cwd) return cwd
   }
   return undefined
@@ -150,21 +215,15 @@ function resolveProjectCwd(
 function getProjectDetail(projectId: string) {
   const { project, messages, interactions } = storage.loadProject(projectId)
   if (!project && !messages.length && !interactions.length) return null
-  // Aggregate: fold haiku helper calls into the surrounding main agent message
-  // so the UI shows one message per user-typed prompt, not one per HTTP round-trip.
-  const aggregated = aggregateMessages(messages, interactions, countToolUseBlocks)
+  // Aggregate: fold helper calls into the surrounding main-agent message
+  // so the UI shows one message per user-typed prompt, not one per HTTP
+  // round-trip.
+  const aggregated = aggregateMessages(messages, interactions, countToolUses)
   const cwd = resolveProjectCwd(project, interactions)
   return {
     project: project ? { ...project, cwd } : project,
     messages: aggregated,
   }
-}
-
-function countToolUseBlocks(it: CapturedInteraction): number {
-  const blocks = it.response?.content ?? []
-  let n = 0
-  for (const b of blocks) if (b.type === 'tool_use') n++
-  return n
 }
 
 function getInteraction(projectId: string, interactionId: string) {
@@ -209,10 +268,11 @@ export function createCaptureMiddleware() {
       logReq(req.method ?? '?', urlPath)
     }
 
-    // Proxy endpoint.
-    if (urlPath === '/v1/messages') {
+    // Proxy endpoints — one per protocol adapter.
+    const protocolProxy = protocolProxies.get(urlPath)
+    if (protocolProxy && adapterForPath(urlPath)) {
       try {
-        await proxy(req, res)
+        await protocolProxy(req, res)
       } catch (e: any) {
         if (!res.headersSent) {
           sendJson(res, 500, { error: 'internal', message: String(e?.message ?? e) })

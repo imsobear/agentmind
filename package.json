@@ -18,6 +18,7 @@
     "preview": "vite preview",
     "start": "node dist/agentmind/cli.mjs",
     "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke-codex.mjs",
     "prepublishOnly": "pnpm build && pnpm typecheck"
   },
   "dependencies": {

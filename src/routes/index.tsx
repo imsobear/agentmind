@@ -17,17 +17,31 @@ function Empty() {
   }, [])
   return (
     <div className="h-full flex items-center justify-center text-muted-foreground">
-      <div className="text-center max-w-md px-6">
+      <div className="text-center max-w-lg px-6">
         <Inbox className="w-10 h-10 mx-auto mb-4 opacity-50" />
         <div className="text-base font-medium text-foreground mb-2">No project selected</div>
-        <p className="text-sm leading-relaxed">
-          Run{' '}
-          <code className="px-1.5 py-0.5 rounded bg-muted text-xs">
-            ANTHROPIC_BASE_URL=http://{host} claude
-          </code>{' '}
-          in any terminal. Every API call goes through this proxy and shows up
+        <p className="text-sm leading-relaxed mb-3">
+          Point any supported agent at this proxy. Every API call shows up
           in the sidebar as a new project (one per cwd).
         </p>
+        <div className="flex flex-col gap-1.5 text-xs text-left">
+          <div className="flex items-baseline gap-2">
+            <span className="font-mono uppercase tracking-wider text-[10px] text-muted-foreground/80 w-14 shrink-0">
+              Claude
+            </span>
+            <code className="px-1.5 py-0.5 rounded bg-muted truncate">
+              ANTHROPIC_BASE_URL=http://{host} claude
+            </code>
+          </div>
+          <div className="flex items-baseline gap-2">
+            <span className="font-mono uppercase tracking-wider text-[10px] text-muted-foreground/80 w-14 shrink-0">
+              Codex
+            </span>
+            <code className="px-1.5 py-0.5 rounded bg-muted truncate">
+              OPENAI_BASE_URL=http://{host}/v1 codex
+            </code>
+          </div>
+        </div>
       </div>
     </div>
   )

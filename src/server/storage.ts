@@ -79,60 +79,6 @@ export class Storage {
     return out
   }
 
-  // Rebuild just enough of a Grouper's in-memory project state for the
-  // Grouper to extend a message chain that already exists on disk.
-  // Returns `undefined` when the cwd has no project file yet so the
-  // caller can mark its in-process project as `isNewProject`.
-  hydrateProject(cwd: string): {
-    cwd: string
-    messages: Array<{
-      messageId: string
-      index: number
-      lastMessages: import('../lib/anthropic-types').MessageParam[]
-      userPromptCount: number
-      interactionCount: number
-    }>
-  } | undefined {
-    const projectId = projectIdForCwd(cwd)
-    const file = this.projectFile(projectId)
-    if (!fs.existsSync(file)) return undefined
-    const { messages, interactions } = this.loadProject(projectId)
-    if (!messages.length && !interactions.length) return undefined
-    // For each persisted message, find its latest captured interaction
-    // (sort by index, take last) to recover the union `messages` array
-    // we would have built in memory.
-    const byMessage = new Map<string, CapturedInteraction[]>()
-    for (const it of interactions) {
-      const list = byMessage.get(it.messageId) ?? []
-      list.push(it)
-      byMessage.set(it.messageId, list)
-    }
-    const out = messages.map((m) => {
-      const its = (byMessage.get(m.messageId) ?? []).sort((a, b) => a.index - b.index)
-      const last = its[its.length - 1]
-      const lastMessages = last?.request?.messages ?? []
-      let userPromptCount = 0
-      for (const mp of lastMessages) {
-        if (mp.role === 'user') {
-          if (typeof mp.content === 'string') {
-            if (mp.content.trim()) userPromptCount++
-          } else {
-            const hasToolResult = mp.content.some((b: any) => b.type === 'tool_result')
-            if (!hasToolResult) userPromptCount++
-          }
-        }
-      }
-      return {
-        messageId: m.messageId,
-        index: m.index,
-        lastMessages,
-        userPromptCount,
-        interactionCount: its.length,
-      }
-    })
-    return { cwd, messages: out }
-  }
-
   // Read all records of a project. last-wins merge on interactionId.
   loadProject(projectId: string): {
     project?: CapturedProject

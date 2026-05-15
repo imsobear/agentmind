@@ -33,7 +33,7 @@
 //   from their own short message arrays that don't extend any existing
 //   message → each opens a fresh message too.
 
-import type { AnthropicRequest, MessageParam } from '../lib/anthropic-types'
+import type { AgentType, MessageParam } from '../lib/anthropic-types'
 import { projectIdForCwd } from './projectId'
 
 interface Message {
@@ -55,6 +55,12 @@ interface Project {
   // Always present after the first such request — undefined only for
   // brand-new in-process state before any cwd has been seen.
   cwd: string
+  // The agent type that opened this project. We don't change this once
+  // set — even if a different agent later writes into the same cwd,
+  // the project's "primary agent" stays whoever got there first. The
+  // per-interaction `agentType` tag still records the true protocol of
+  // each individual round-trip, so mixed-agent projects render correctly.
+  primaryAgent: AgentType
   messages: Message[]
 }
 
@@ -70,6 +76,7 @@ export interface GroupResolution {
   // The cwd we ultimately attributed the request to. Useful for the
   // proxy when it writes the `project` header record on first sight.
   cwd: string
+  primaryAgent: AgentType
 }
 
 function isUserPromptMessage(m: MessageParam): boolean {
@@ -158,6 +165,7 @@ function isPrefixOf(prev: MessageParam[], next: MessageParam[]): boolean {
 // without rehydration the second run's "iter 1" would re-use index 0).
 export interface ProjectHydration {
   cwd: string
+  primaryAgent: AgentType
   messages: Array<{
     messageId: string
     index: number
@@ -189,12 +197,18 @@ export class Grouper {
     this.deps = deps
   }
 
-  resolve(
-    req: AnthropicRequest,
-    now: number,
-    newId: () => string,
-    cwd: string | undefined,
-  ): GroupResolution {
+  // Protocol-agnostic resolve. The proxy normalises whatever the adapter
+  // saw (Anthropic `messages` array or Codex `input[]` flattened) into
+  // MessageParam[] and hands it here; we don't care which protocol
+  // produced it — prefix-equality reads the same on either.
+  resolve(args: {
+    messages: MessageParam[]
+    now: number
+    newId: () => string
+    cwd: string | undefined
+    agentType: AgentType
+  }): GroupResolution {
+    const { messages, now, newId, cwd, agentType } = args
     const resolvedCwd = cwd ?? this.lastCwd ?? '_orphan_'
 
     let project = this.projects.get(resolvedCwd)
@@ -208,6 +222,9 @@ export class Grouper {
         projectId: projectIdForCwd(resolvedCwd),
         startedAt: now,
         cwd: resolvedCwd,
+        // Hydrated projects keep their existing primaryAgent. Fresh
+        // projects inherit whatever agent first wrote to them.
+        primaryAgent: hydration?.primaryAgent ?? agentType,
         messages: hydration?.messages.map((m) => ({ ...m })) ?? [],
       }
       this.projects.set(resolvedCwd, project)
@@ -218,11 +235,11 @@ export class Grouper {
     if (cwd) this.lastCwd = cwd
 
     // ── pick / open message inside project
-    const reqUserPrompts = countUserPrompts(req.messages)
+    const reqUserPrompts = countUserPrompts(messages)
     let message: Message | undefined
     for (const m of project.messages) {
       if (m.userPromptCount !== reqUserPrompts) continue
-      if (isPrefixOf(m.lastMessages, req.messages)) {
+      if (isPrefixOf(m.lastMessages, messages)) {
         message = m
         break
       }
@@ -232,7 +249,7 @@ export class Grouper {
       message = {
         messageId: newId(),
         index: project.messages.length,
-        lastMessages: req.messages,
+        lastMessages: messages,
         userPromptCount: reqUserPrompts,
         interactionCount: 0,
       }
@@ -240,7 +257,7 @@ export class Grouper {
       isNewMessage = true
     } else {
       // extension: update lastMessages
-      message.lastMessages = req.messages
+      message.lastMessages = messages
     }
 
     const interactionIndex = message.interactionCount
@@ -249,9 +266,9 @@ export class Grouper {
     // first-user-text preview for newly opened message
     let preview: string | undefined
     if (isNewMessage) {
-      for (let i = req.messages.length - 1; i >= 0; i--) {
-        if (isUserPromptMessage(req.messages[i])) {
-          preview = firstUserText(req.messages[i])
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (isUserPromptMessage(messages[i])) {
+          preview = firstUserText(messages[i])
           break
         }
       }
@@ -265,8 +282,9 @@ export class Grouper {
       isNewMessage,
       interactionIndex,
       firstUserText: preview,
-      isFirstCall: req.messages.length === 1 && req.messages[0]?.role === 'user',
+      isFirstCall: messages.length === 1 && messages[0]?.role === 'user',
       cwd: resolvedCwd,
+      primaryAgent: project.primaryAgent,
     }
   }
 
@@ -274,6 +292,7 @@ export class Grouper {
     return Array.from(this.projects.values()).map((p) => ({
       projectId: p.projectId,
       cwd: p.cwd,
+      primaryAgent: p.primaryAgent,
       messageCount: p.messages.length,
     }))
   }

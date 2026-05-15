@@ -41,12 +41,16 @@ USAGE:
   agentmind-cli                 start on port 8088 and open the browser
   agentmind-cli --port 9000     use a specific port
   agentmind-cli --no-open       don't auto-open the browser
-  agentmind-cli --data <dir>    persist projects under <dir>/sessions/<id>.jsonl
+  agentmind-cli --data <dir>    persist projects under <dir>/projects/<id>.jsonl
                                 (default ~/.agentmind)
   agentmind-cli --dev           force dev mode (vite + HMR) even if dist/ exists
 
-POINTING CLAUDE CODE AT IT:
+POINT AN AGENT AT IT:
+  # Claude Code (Anthropic Messages API)
   ANTHROPIC_BASE_URL=http://127.0.0.1:8088 claude
+
+  # Codex CLI (OpenAI Responses API)
+  OPENAI_BASE_URL=http://127.0.0.1:8088/v1 codex
 
 `)
   process.exit(0)
@@ -65,7 +69,9 @@ async function maybeOpenBrowser() {
   if (noOpen) return
   await delay(200)
   process.stdout.write(
-    `\n► Point Claude Code at agentmind:\n    ANTHROPIC_BASE_URL=${url} claude\n\n`,
+    `\n► Point your agent at agentmind:\n` +
+      `    Claude Code: ANTHROPIC_BASE_URL=${url} claude\n` +
+      `    Codex CLI:   OPENAI_BASE_URL=${url}/v1 codex\n\n`,
   )
   try {
     const { default: open } = await import('open')

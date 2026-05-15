@@ -25,7 +25,21 @@
 //
 // Only the MAIN call's iterations are kept and rendered.
 
-import type { CapturedInteraction, CapturedMessage } from '../lib/anthropic-types'
+import type {
+  AnthropicRequest,
+  AnthropicResponse,
+  CapturedInteraction,
+  CapturedMessage,
+} from '../lib/anthropic-types'
+import {
+  agentTypeOf,
+  isMainInteractionFor,
+  latestUserTextFromRequest,
+  modelOf,
+  stopReasonOf,
+  transcriptLength,
+  usageOf,
+} from './interaction-view'
 
 export interface InteractionStub {
   interactionId: string
@@ -38,13 +52,17 @@ export interface InteractionStub {
   stopReason: unknown
   usage?: unknown
   hasError: boolean
-  // Count of messages this iteration inherited verbatim from the previous
-  // main-agent iteration's `request.messages`. The first `prevMessageCount`
-  // entries are the cached/inherited prefix; everything from
-  // `prevMessageCount` onwards is what was appended between the two calls
-  // (the assistant's previous output + the tool_result(s) it produced).
-  // 0 for the first iteration of a message — the whole array is "new".
+  // Count of items this iteration inherited verbatim from the previous
+  // main-agent iteration's transcript (Anthropic `messages` / Responses
+  // `input`). The first `prevMessageCount` entries are the cached
+  // prefix; everything from `prevMessageCount` onwards is what was
+  // appended between the two calls (the assistant's previous output +
+  // the tool_result(s) it produced). 0 for the first iteration of a
+  // message — the whole array is "new".
   prevMessageCount: number
+  // Stamp the per-iteration agent type so cards can render the correct
+  // protocol view. Optional for back-compat (pre-0.2 stubs lacked it).
+  agentType?: import('../lib/anthropic-types').AgentType
 }
 
 // One local tool execution, paired by tool_use_id between two iterations.
@@ -92,14 +110,14 @@ export interface AggregatedMessage extends CapturedMessage {
   actionSegments: ActionSegment[]
 }
 
-const MAIN_TOOL_THRESHOLD = 1 // ≥1 tool on the request = main agent
-
 // A request whose `tools` array is non-empty came from the real agent.
-// Anything with zero tools is a Claude Code helper call (haiku topic
-// classifier, post-processing, title generator) — pure framework noise
-// from the user's perspective, dropped at display time.
+// Anything with zero tools is a helper call (Claude Code's haiku topic
+// classifier, post-processing, title generator; Codex CLI's compaction /
+// summariser) — pure framework noise from the user's perspective,
+// dropped at display time. See `interaction-view.isMainInteractionFor`
+// for the protocol-agnostic implementation.
 export function isMainInteraction(it: CapturedInteraction): boolean {
-  return (it.request?.tools?.length ?? 0) >= MAIN_TOOL_THRESHOLD
+  return isMainInteractionFor(it)
 }
 
 export function aggregateMessages(
@@ -144,32 +162,13 @@ export function aggregateMessages(
   return aggregated
 }
 
-// Pull the latest user-typed text from a main interaction's messages array.
-// Falls back to whatever is in the first user message, minus system-reminder
-// wrappers, since claude code interleaves those into the user role.
+// Pull the latest user-typed text from a main interaction's request.
+// Delegates to interaction-view so the per-protocol differences (Anthropic
+// `messages` with <system-reminder> wrappers vs Responses `input` with
+// plain text blocks) live in one place.
 function deriveFirstUserText(mainIts: CapturedInteraction[]): string | undefined {
   if (!mainIts.length) return undefined
-  const msgs = mainIts[0].request?.messages ?? []
-  // Walk in reverse to find the freshest user-typed text.
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i]
-    if (m.role !== 'user') continue
-    let text: string | undefined
-    if (typeof m.content === 'string') text = m.content
-    else {
-      for (const b of m.content) {
-        if (b.type === 'text') {
-          const stripped = b.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
-          if (stripped) {
-            text = stripped
-            break
-          }
-        }
-      }
-    }
-    if (text) return text
-  }
-  return undefined
+  return latestUserTextFromRequest(mainIts[0])
 }
 
 function buildAggregated(
@@ -184,12 +183,17 @@ function buildAggregated(
     startedAt: it.startedAt,
     endedAt: it.endedAt,
     durationMs: it.durationMs,
-    model: it.request?.model,
+    model: modelOf(it),
+    // Caller can pass a custom counter (middleware does, for legacy
+    // reasons), but the per-protocol default in interaction-view is
+    // identical, so the parameter is now effectively redundant. Kept
+    // for the signature compat.
     toolCount: countToolUseBlocks(it),
-    stopReason: it.response?.stop_reason ?? null,
-    usage: it.response?.usage,
+    stopReason: stopReasonOf(it) as InteractionStub['stopReason'],
+    usage: usageOf(it),
     hasError: !!it.error,
-    prevMessageCount: idx > 0 ? (its[idx - 1].request?.messages?.length ?? 0) : 0,
+    prevMessageCount: idx > 0 ? transcriptLength(its[idx - 1]) : 0,
+    agentType: agentTypeOf(it),
   }))
   const earliestStart = stubs.length ? stubs[0].startedAt : m.startedAt
   const stopReason = stubs.length ? stubs[stubs.length - 1].stopReason : null
@@ -262,10 +266,19 @@ function flattenResultContent(content: unknown): {
 }
 
 export function computeActionSegments(its: CapturedInteraction[]): ActionSegment[] {
+  // Action segments are currently only computed for Anthropic
+  // interactions — the tool_use/tool_result pairing is bespoke to that
+  // shape (see implementation below). For Codex CLI's Responses-API
+  // traffic the equivalent pairing (function_call → function_call_output)
+  // is reconstructible but not implemented in 0.2.0; segments stay
+  // empty for those messages and the UI falls back to the per-iter card
+  // view. Tracked as a polish ticket for 0.3.
+  if (its.length && agentTypeOf(its[0]) !== 'claude-code') return []
   const segments: ActionSegment[] = []
   for (let i = 0; i < its.length; i++) {
     const cur = its[i]
-    const toolUses = (cur.response?.content ?? []).filter(
+    const curResp = cur.response as AnthropicResponse | undefined
+    const toolUses = (curResp?.content ?? []).filter(
       (b) => b.type === 'tool_use',
     ) as Array<{ type: 'tool_use'; id: string; name: string; input: unknown }>
     if (toolUses.length === 0) continue
@@ -287,7 +300,8 @@ export function computeActionSegments(its: CapturedInteraction[]): ActionSegment
       continue
     }
 
-    const msgs = next.request?.messages ?? []
+    const nextReq = next.request as AnthropicRequest | undefined
+    const msgs = nextReq?.messages ?? []
     let toolResults: Array<{
       tool_use_id: string
       content: unknown
@@ -297,7 +311,7 @@ export function computeActionSegments(its: CapturedInteraction[]): ActionSegment
       const m = msgs[j]
       if (m.role !== 'user' || typeof m.content === 'string') continue
       const trs = m.content.filter(
-        (b) => (b as { type?: string }).type === 'tool_result',
+        (b: any) => b.type === 'tool_result',
       ) as Array<{ tool_use_id: string; content: unknown; is_error?: boolean }>
       if (trs.length) {
         toolResults = trs
